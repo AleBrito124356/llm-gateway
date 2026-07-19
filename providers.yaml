@@ -1,0 +1,59 @@
+# Upstream providers and model routes.
+#
+# A provider is any OpenAI-compatible server: base_url + an API key read from an
+# environment variable (api_key_env). A model entry maps a gateway-facing model
+# id to a provider and, optionally, a different upstream_model name.
+
+providers:
+  nvidia:
+    # Free NVIDIA NIM. Get a key (nvapi-...) in 2 minutes at build.nvidia.com.
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key_env: NVIDIA_API_KEY
+    timeout: 60
+
+  ollama:
+    # Local models. `ollama serve` exposes an OpenAI-compatible API on 11434.
+    # Ollama ignores the token, but a valid header is still sent.
+    base_url: http://localhost:11434/v1
+    api_key_env: OLLAMA_API_KEY
+    default_api_key: ollama
+    timeout: 120
+
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    timeout: 60
+
+  together:
+    base_url: https://api.together.xyz/v1
+    api_key_env: TOGETHER_API_KEY
+    timeout: 60
+
+# Gateway model id -> provider (+ optional upstream_model, cache toggles).
+models:
+  meta/llama-3.3-70b-instruct:
+    provider: nvidia
+  meta/llama-3.1-8b-instruct:
+    provider: nvidia
+  meta/llama-3.1-70b-instruct:
+    provider: nvidia
+  # Embedding model used for both /v1/embeddings and the semantic cache.
+  nvidia/nv-embedqa-e5-v5:
+    provider: nvidia
+
+  # Local Ollama models. Handy as failover targets when NIM has an outage.
+  ollama/llama3.1:
+    provider: ollama
+    upstream_model: llama3.1
+    # Local generations are already free and often non-deterministic; skip the
+    # semantic layer to avoid serving a stale answer for a slightly different ask.
+    semantic_cache: false
+  ollama/nomic-embed-text:
+    provider: ollama
+    upstream_model: nomic-embed-text
+
+  # Real OpenAI / Together, if you set their keys.
+  gpt-4o-mini:
+    provider: openai
+  meta-llama/Llama-3.3-70B-Instruct-Turbo:
+    provider: together

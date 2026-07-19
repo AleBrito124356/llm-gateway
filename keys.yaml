@@ -1,0 +1,24 @@
+# Virtual gateway keys. Only SHA-256 hashes are stored, so this file is safe to
+# commit and clients never see your upstream provider keys.
+#
+# Mint a new key:  python -m app.keys generate --name my-app --rpm 120 --budget 25
+# Hash an existing one: python -m app.keys hash sk-gw-...
+#
+# allowed_models supports globs ("*", "meta/*"). monthly_budget_usd is optional
+# (omit for unlimited). rpm is the token-bucket request-per-minute limit.
+
+keys:
+  # Demo key shipped for the quickstart and client_example.py.
+  # PLAINTEXT: sk-gw-demo-000-not-a-real-secret  -> rotate before any real use.
+  - name: demo
+    key_hash: db08fd09bef90acab8dd92fb2e3ee762d65248e412310a2b04a95deb1e970603
+    rpm: 60
+    monthly_budget_usd: 5.0
+    allowed_models: ["*"]
+
+  # Example of a locked-down key: only the cheap model, tight budget.
+  - name: cheap-only
+    key_hash: 0000000000000000000000000000000000000000000000000000000000000000
+    rpm: 30
+    monthly_budget_usd: 1.0
+    allowed_models: ["meta/llama-3.1-8b-instruct", "nvidia/nv-embedqa-e5-v5"]

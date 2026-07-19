@@ -1,0 +1,32 @@
+services:
+  gateway:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Provider keys are read from your shell / .env, never baked into the image.
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:?set NVIDIA_API_KEY in your .env}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-ollama}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      NIM_MODEL: ${NIM_MODEL:-meta/llama-3.3-70b-instruct}
+      EMBED_MODEL: ${EMBED_MODEL:-nvidia/nv-embedqa-e5-v5}
+      REQUIRE_AUTH: ${REQUIRE_AUTH:-true}
+      CACHE_SIMILARITY_THRESHOLD: ${CACHE_SIMILARITY_THRESHOLD:-0.92}
+      GATEWAY_DB: /data/gateway.db
+    volumes:
+      # Persist the SQLite cache + usage ledger across restarts.
+      - gateway-data:/data
+      # Edit config without rebuilding the image.
+      - ./providers.yaml:/app/providers.yaml:ro
+      - ./routing.yaml:/app/routing.yaml:ro
+      - ./keys.yaml:/app/keys.yaml:ro
+      - ./pricing.json:/app/pricing.json:ro
+    restart: unless-stopped
+    # To reach a host-local Ollama from inside the container, either use
+    # host.docker.internal (Docker Desktop) or add:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+volumes:
+  gateway-data:

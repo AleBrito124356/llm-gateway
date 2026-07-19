@@ -1,0 +1,12 @@
+{
+  "_comment": "USD per 1,000,000 tokens. NVIDIA NIM's free tier costs nothing; these reference prices approximate what the same tokens cost on a paid Llama host so the cost ledger stays meaningful. Set any model to 0 to track tokens only. Local Ollama models are free.",
+  "default": { "input_per_1m": 0.20, "output_per_1m": 0.20 },
+  "meta/llama-3.3-70b-instruct": { "input_per_1m": 0.90, "output_per_1m": 0.90 },
+  "meta/llama-3.1-70b-instruct": { "input_per_1m": 0.90, "output_per_1m": 0.90 },
+  "meta/llama-3.1-8b-instruct": { "input_per_1m": 0.06, "output_per_1m": 0.06 },
+  "nvidia/nv-embedqa-e5-v5": { "input_per_1m": 0.02, "output_per_1m": 0.0 },
+  "ollama/llama3.1": { "input_per_1m": 0.0, "output_per_1m": 0.0 },
+  "ollama/nomic-embed-text": { "input_per_1m": 0.0, "output_per_1m": 0.0 },
+  "gpt-4o-mini": { "input_per_1m": 0.15, "output_per_1m": 0.60 },
+  "meta-llama/Llama-3.3-70B-Instruct-Turbo": { "input_per_1m": 0.88, "output_per_1m": 0.88 }
+}

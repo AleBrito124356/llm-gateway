@@ -1,0 +1,40 @@
+# Routing rules.
+#
+# `auto`      : the virtual model. Requests to model "auto" are classified by
+#               heuristics and sent to either the cheap or the strong model.
+# `aliases`   : rename familiar model ids onto whatever you actually serve.
+# `fallbacks` : ordered failover chain per gateway model. May cross providers.
+
+auto:
+  long_prompt_chars: 2000
+  models:
+    cheap: meta/llama-3.1-8b-instruct
+    strong: meta/llama-3.3-70b-instruct
+  # First matching rule wins. Signals: code, json_mode, long_prompt, default.
+  rules:
+    - if: code
+      use: strong
+    - if: json_mode
+      use: strong
+    - if: long_prompt
+      use: strong
+    - if: default
+      use: cheap
+
+aliases:
+  # Point OpenAI model names at free NIM models so existing code "just works".
+  gpt-3.5-turbo: meta/llama-3.1-8b-instruct
+  gpt-4: meta/llama-3.3-70b-instruct
+  gpt-4o: meta/llama-3.3-70b-instruct
+  text-embedding-3-small: nvidia/nv-embedqa-e5-v5
+
+fallbacks:
+  # If the 70B on NIM 5xx's or times out, retry, then fail over to the 8B, then
+  # to a local Ollama model. Each hop is tried before giving up.
+  meta/llama-3.3-70b-instruct:
+    - meta/llama-3.1-8b-instruct
+    - ollama/llama3.1
+  meta/llama-3.1-8b-instruct:
+    - ollama/llama3.1
+  nvidia/nv-embedqa-e5-v5:
+    - ollama/nomic-embed-text
