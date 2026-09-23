@@ -62,6 +62,11 @@ class Settings:
     backoff_cap_seconds: float = 8.0
     request_timeout_seconds: float = 60.0
 
+    # Circuit breaker: open a target after this many consecutive failures and
+    # probe it again after the cooldown. A threshold of 0 disables the breaker.
+    breaker_failure_threshold: int = 5
+    breaker_cooldown_seconds: float = 30.0
+
     require_auth: bool = True
     # Protects /admin/*. Unset means the admin endpoints are open (dev only).
     admin_token: Optional[str] = None
@@ -105,6 +110,8 @@ class Settings:
             backoff_base_seconds=_env_float(env, "BACKOFF_BASE_SECONDS", 0.5),
             backoff_cap_seconds=_env_float(env, "BACKOFF_CAP_SECONDS", 8.0),
             request_timeout_seconds=_env_float(env, "REQUEST_TIMEOUT_SECONDS", 60.0),
+            breaker_failure_threshold=_env_int(env, "BREAKER_FAILURE_THRESHOLD", 5),
+            breaker_cooldown_seconds=_env_float(env, "BREAKER_COOLDOWN_SECONDS", 30.0),
             require_auth=_env_bool(env, "REQUIRE_AUTH", True),
             admin_token=env.get("ADMIN_TOKEN") or None,
         )

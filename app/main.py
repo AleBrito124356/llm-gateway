@@ -5,6 +5,7 @@ Endpoints:
     POST /v1/embeddings         - embeddings
     GET  /v1/models             - list gateway models
     GET  /admin/usage           - usage + cost summary (JSON or HTML)
+    GET  /admin/health          - circuit-breaker state and last error per target
     GET  /healthz               - liveness
 
 Point any OpenAI SDK at this server by setting ``base_url`` to
@@ -28,9 +29,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from .accounting import Accounting, Pricing, approx_tokens, next_month_start_epoch
 from .cache import CacheProbe, SemanticCache
 from .config import Settings
-from .fallback import UpstreamError, execute_with_fallback
+from .fallback import CircuitBreaker, FallbackResult, UpstreamError, execute_with_fallback, summarize_attempts
 from .keys import KeyStore, VirtualKey
-from .limits import RateLimiter, check_budget
+from .limits import RateLimiter, check_budget, retry_after_header
 from .providers import ProviderRegistry, Target, UnknownModelError
 from .router import Router, RoutingConfig
 from .schemas import (
@@ -38,7 +39,7 @@ from .schemas import (
     EmbeddingRequest,
     build_chat_response,
 )
-from .upstream import parse_sse_event, post_chat, post_embeddings, stream_chat
+from .upstream import iter_sse_lines, open_chat_stream, parse_sse_event, post_chat, post_embeddings
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -84,13 +85,34 @@ def upstream_body(body: dict[str, Any]) -> dict[str, Any]:
 def client_status(err: UpstreamError) -> int:
     """HTTP status the caller sees for an upstream failure.
 
-    Upstream auth failures (a revoked or missing *provider* key) are the
-    gateway's problem, not the caller's: surfacing them as 401/403 would make
-    the OpenAI SDK report the caller's own gateway key as invalid.
+    The executor already turns exhausted chains into 502 (or 503 when every
+    circuit is open) and passes caller errors (400/413/422) through. Upstream
+    auth failures are the gateway's problem, not the caller's: surfacing them
+    as 401/403 would make the OpenAI SDK report the caller's own gateway key
+    as invalid, so they are mapped to 502 defensively.
     """
-    if err.status_code >= 500 or err.status_code in (401, 403):
+    if err.status_code in (401, 403) or (err.status_code >= 500 and err.status_code != 503):
         return 502
     return err.status_code
+
+
+def upstream_error_response(err: UpstreamError, headers: dict[str, str]) -> JSONResponse:
+    headers = dict(headers)
+    if err.attempts:
+        headers["X-Gateway-Attempts"] = summarize_attempts(err.attempts)
+    status = client_status(err)
+    if status == 503 and err.retry_after is not None:
+        headers["Retry-After"] = str(retry_after_header(err.retry_after))
+    return openai_error(status, err.message, "upstream_error", headers)
+
+
+def served_headers(result: FallbackResult) -> dict[str, str]:
+    target: Target = result.target
+    return {
+        "X-Gateway-Provider": target.provider.name,
+        "X-Upstream-Model": target.upstream_model,
+        "X-Gateway-Attempts": result.summary,
+    }
 
 
 def make_embedder(client: httpx.AsyncClient, registry: ProviderRegistry, embed_model: str):
@@ -121,6 +143,7 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
     pricing = Pricing.from_file(settings.pricing_file)
     accounting = Accounting(db, pricing)
     limiter = RateLimiter()
+    breaker = CircuitBreaker(settings.breaker_failure_threshold, settings.breaker_cooldown_seconds)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -155,6 +178,17 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
     app.state.keystore = keystore
     app.state.accounting = accounting
     app.state.limiter = limiter
+    app.state.breaker = breaker
+
+    async def run_chain(chain: list[Target], attempt) -> FallbackResult:
+        return await execute_with_fallback(
+            chain, attempt,
+            max_retries_per_target=settings.max_retries_per_target,
+            backoff_base=settings.backoff_base_seconds,
+            backoff_cap=settings.backoff_cap_seconds,
+            target_name=lambda t: t.name,
+            breaker=breaker,
+        )
 
     # ------------------------------------------------------------------ auth
     def authenticate(request: Request) -> VirtualKey:
@@ -269,27 +303,31 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
         forward = upstream_body(body)
 
         if req.stream:
+            # Open the upstream stream (with retries and failover) *before*
+            # answering, so a dead chain is a proper HTTP error and the headers
+            # can name the provider that is actually streaming.
+            async def open_attempt(target: Target) -> httpx.Response:
+                return await open_chat_stream(client, target.provider, target.payload(forward))
+
+            try:
+                opened = await run_chain(chain, open_attempt)
+            except UpstreamError as err:
+                return upstream_error_response(err, base_headers)
             return StreamingResponse(
-                stream_and_account(
-                    app, client, chain, forward, body, gateway_model, key, exact_ok, semantic_ok,
-                    probe, wants_usage,
+                relay_stream(
+                    app, opened.value, opened.target, body, gateway_model, key,
+                    exact_ok, semantic_ok, probe, wants_usage,
                 ),
-                media_type="text/event-stream", headers=base_headers,
+                media_type="text/event-stream", headers={**base_headers, **served_headers(opened)},
             )
 
         async def attempt(target: Target) -> dict[str, Any]:
             return await post_chat(client, target.provider, target.payload(forward))
 
         try:
-            result = await execute_with_fallback(
-                chain, attempt,
-                max_retries_per_target=settings.max_retries_per_target,
-                backoff_base=settings.backoff_base_seconds,
-                backoff_cap=settings.backoff_cap_seconds,
-                target_name=lambda t: t.name,
-            )
+            result = await run_chain(chain, attempt)
         except UpstreamError as err:
-            return openai_error(client_status(err), err.message, "upstream_error", base_headers)
+            return upstream_error_response(err, base_headers)
 
         data = result.value
         used: Target = result.target
@@ -303,8 +341,7 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
         if exact_ok:
             await _store_in_cache(cache, gateway_model, body, data, semantic_ok, probe)
 
-        headers = {**base_headers, "X-Gateway-Provider": used.provider.name, "X-Upstream-Model": used.upstream_model}
-        return JSONResponse(content=data, headers=headers)
+        return JSONResponse(content=data, headers={**base_headers, **served_headers(result)})
 
     # ---------------------------------------------------------- embeddings
     @app.post("/v1/embeddings")
@@ -337,15 +374,9 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
             return await post_embeddings(client, target.provider, target.payload(forward))
 
         try:
-            result = await execute_with_fallback(
-                chain, attempt,
-                max_retries_per_target=settings.max_retries_per_target,
-                backoff_base=settings.backoff_base_seconds,
-                backoff_cap=settings.backoff_cap_seconds,
-                target_name=lambda t: t.name,
-            )
+            result = await run_chain(chain, attempt)
         except UpstreamError as err:
-            return openai_error(client_status(err), err.message, "upstream_error", limit_headers)
+            return upstream_error_response(err, {**limit_headers, "X-Gateway-Model": model})
 
         data = result.value
         used: Target = result.target
@@ -355,10 +386,10 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
             virtual_key=key.name, model=model, provider=used.provider.name,
             endpoint="embeddings", prompt_tokens=prompt_tokens, completion_tokens=0, cached=False,
         )
+        # X-Gateway-Model names the model that produced the vectors: after a
+        # failover it differs from the requested one, and so may the dimensions.
         return JSONResponse(content=data, headers={
-            **limit_headers,
-            "X-Gateway-Model": used.gateway_model,
-            "X-Gateway-Provider": used.provider.name,
+            **limit_headers, "X-Gateway-Model": used.gateway_model, **served_headers(result),
         })
 
     # -------------------------------------------------------------- models
@@ -383,6 +414,36 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
             return JSONResponse(summary)
         return HTMLResponse(render_usage_html(summary))
 
+    @app.get("/admin/health")
+    async def admin_health(request: Request):
+        try:
+            require_admin(request)
+        except GatewayError as err:
+            return openai_error(err.status_code, err.message, err.err_type)
+        targets: dict[str, dict[str, Any]] = {}
+        for model in registry.list_models():
+            target = registry.resolve(model)
+            targets.setdefault(target.name, {"state": "closed", "consecutive_failures": 0,
+                                             "successes": 0, "failures": 0, "last_status": None,
+                                             "last_error": None, "last_error_at": None,
+                                             "last_success_at": None, "retry_in_seconds": 0.0})
+        targets.update(breaker.snapshot())
+        unhealthy = sorted(name for name, t in targets.items() if t["state"] != "closed")
+        return {
+            "status": "degraded" if unhealthy else "ok",
+            "unhealthy_targets": unhealthy,
+            "breaker": {
+                "enabled": breaker.enabled,
+                "failure_threshold": breaker.failure_threshold,
+                "cooldown_seconds": breaker.cooldown_seconds,
+            },
+            "providers": {
+                name: {"base_url": p.base_url, "api_key_set": p.api_key() is not None}
+                for name, p in registry.providers.items()
+            },
+            "targets": targets,
+        }
+
     @app.get("/healthz")
     async def healthz():
         return {"status": "ok", "providers": len(registry.providers), "models": len(registry.models)}
@@ -392,7 +453,8 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
         return {
             "name": "llm-gateway",
             "docs": "/docs",
-            "endpoints": ["/v1/chat/completions", "/v1/embeddings", "/v1/models", "/admin/usage"],
+            "endpoints": ["/v1/chat/completions", "/v1/embeddings", "/v1/models", "/admin/usage",
+                          "/admin/health"],
         }
 
     return app
@@ -470,11 +532,10 @@ async def replay_stream(response: dict[str, Any], model: str, include_usage: boo
     yield b"data: [DONE]\n\n"
 
 
-async def stream_and_account(
+async def relay_stream(
     app: FastAPI,
-    client: httpx.AsyncClient,
-    chain: list[Target],
-    forward: dict[str, Any],
+    resp: httpx.Response,
+    target: Target,
     body: dict[str, Any],
     gateway_model: str,
     key: VirtualKey,
@@ -483,27 +544,25 @@ async def stream_and_account(
     probe: CacheProbe,
     wants_usage: bool,
 ):
-    """Stream from the first working target, then record usage and cache.
+    """Relay an open upstream stream, then record usage and cache the answer.
 
     The gateway always asks the upstream for a usage chunk (for accounting),
     but only forwards it when the caller asked for one: the chunk has an empty
-    ``choices`` list, which clients that did not opt in do not expect.
+    ``choices`` list, which clients that did not opt in do not expect. Usage is
+    recorded even if the client disconnects mid-stream, because the upstream
+    tokens were spent either way; only complete answers are cached.
     """
     accounting: Accounting = app.state.accounting
     cache: SemanticCache = app.state.cache
+    breaker: CircuitBreaker = app.state.breaker
     accumulated: list[str] = []
     usage: dict[str, Any] = {}
-    used: Optional[Target] = None
-    started = False
     saw_tool_calls = False
     finish_reason: Optional[str] = None
-    last_error: Optional[UpstreamError] = None
-
-    for target in chain:
+    completed = False
+    try:
         try:
-            async for chunk in stream_chat(client, target.provider, target.payload(forward)):
-                started = True
-                used = target
+            async for chunk in iter_sse_lines(resp):
                 event = parse_sse_event(chunk.decode("utf-8", "replace").strip())
                 if event is not None:
                     if event.get("usage"):
@@ -522,30 +581,26 @@ async def stream_and_account(
                     if choices == [] and "usage" in event and not wants_usage:
                         continue
                 yield chunk
-            used = used or target
-            break
-        except UpstreamError as err:
-            last_error = err
-            if started or not err.retryable:
-                yield _sse_error(err)
-                return
-            continue
-    else:
-        if last_error is not None:
-            yield _sse_error(last_error)
-        return
+            completed = True
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            err = UpstreamError(504, f"{target.provider.name} stream interrupted: {exc!r}")
+            breaker.record_failure(target.name, err.status_code, err.message)
+            logger.warning("stream from %s interrupted: %r", target.name, exc)
+            yield _sse_error(err)
+    finally:
+        content = "".join(accumulated)
+        prompt_tokens = int(usage.get("prompt_tokens") or approx_tokens(
+            "\n".join(m.get("content", "") if isinstance(m.get("content"), str) else ""
+                      for m in body.get("messages", []))
+        ))
+        completion_tokens = int(usage.get("completion_tokens") or approx_tokens(content))
+        accounting.record(
+            virtual_key=key.name, model=gateway_model, provider=target.provider.name,
+            endpoint="chat", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached=False,
+        )
+        await resp.aclose()
 
-    content = "".join(accumulated)
-    prompt_tokens = int(usage.get("prompt_tokens") or approx_tokens(
-        "\n".join(m.get("content", "") if isinstance(m.get("content"), str) else "" for m in body.get("messages", []))
-    ))
-    completion_tokens = int(usage.get("completion_tokens") or approx_tokens(content))
-    provider_name = used.provider.name if used else (chain[0].provider.name if chain else "unknown")
-    accounting.record(
-        virtual_key=key.name, model=gateway_model, provider=provider_name,
-        endpoint="chat", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached=False,
-    )
-    if exact_ok and content and not saw_tool_calls and body.get("n") in (None, 1):
+    if completed and exact_ok and content and not saw_tool_calls and body.get("n") in (None, 1):
         response = build_chat_response(
             gateway_model, content,
             {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
