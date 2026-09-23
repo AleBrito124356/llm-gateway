@@ -3,40 +3,53 @@
 Endpoints:
     POST /v1/chat/completions   - chat, streaming and non-streaming
     POST /v1/embeddings         - embeddings
-    GET  /v1/models             - list gateway models
-    GET  /admin/usage           - usage + cost summary (JSON or HTML)
+    GET  /v1/models             - models the calling key may use
+    GET  /admin/usage           - usage, cost and cache savings (JSON or HTML)
+    GET  /admin/health          - circuit-breaker state and last error per target
+    POST /admin/reload          - re-read the four config files without a restart
     GET  /healthz               - liveness
 
 Point any OpenAI SDK at this server by setting ``base_url`` to
 ``http://localhost:8000/v1`` and ``api_key`` to a gateway virtual key.
+
+Run it with ``llm-gateway serve``, ``uvicorn --factory app.main:create_app`` or
+the classic ``uvicorn app.main:app``. Importing this module has no side effects:
+the module-level ``app`` is built lazily, on first access, from the environment.
 """
 
 from __future__ import annotations
 
+import hmac
+import html
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Union
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from .accounting import Accounting, Pricing, approx_tokens
-from .cache import SemanticCache
+from . import __version__
+from .accounting import Accounting, Pricing, approx_tokens, next_month_start_epoch
+from .cache import CacheProbe, SemanticCache
+from .checks import ERROR, validate_config
 from .config import Settings
-from .fallback import UpstreamError, execute_with_fallback
+from .fallback import CircuitBreaker, FallbackResult, UpstreamError, execute_with_fallback, summarize_attempts
 from .keys import KeyStore, VirtualKey
-from .limits import RateLimiter, check_budget
-from .providers import ProviderRegistry, Target, UnknownModelError
+from .limits import RateLimiter, check_budget, retry_after_header
+from .mock import LOCAL_HASH_MODEL, GatewayTransport, build_mocks, hash_embedding
+from .providers import ConfigError, ModelRoute, ProviderRegistry, Target, UnknownModelError
 from .router import Router, RoutingConfig
 from .schemas import (
     ChatCompletionRequest,
     EmbeddingRequest,
     build_chat_response,
 )
-from .upstream import parse_sse_content, post_chat, post_embeddings, stream_chat
+from .upstream import iter_sse_lines, open_chat_stream, parse_sse_event, post_chat, post_embeddings
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -44,15 +57,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger("gateway")
 
+# Request fields that configure the gateway itself. They are consumed here and
+# never forwarded: OpenAI and most compatible servers reject unknown arguments.
+GATEWAY_ONLY_FIELDS = frozenset({"cache"})
+
 
 class GatewayError(Exception):
     """A request-scoped error that maps to an OpenAI-style error response."""
 
-    def __init__(self, status_code: int, message: str, err_type: str = "invalid_request_error") -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        err_type: str = "invalid_request_error",
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.err_type = err_type
+        self.headers = headers or {}
+
+
+@dataclass(frozen=True)
+class GatewayConfig:
+    """Everything read from the four config files, swapped atomically on reload."""
+
+    registry: ProviderRegistry
+    routing: RoutingConfig
+    router: Router
+    keystore: KeyStore
+    pricing: Pricing
+    loaded_at: float
+
+
+def load_config(settings: Settings) -> GatewayConfig:
+    registry = ProviderRegistry.from_file(settings.providers_file)
+    try:
+        routing = RoutingConfig.from_file(settings.routing_file)
+    except FileNotFoundError as exc:
+        raise ConfigError(f"{exc} (set CONFIG_DIR or ROUTING_FILE)") from exc
+    return GatewayConfig(
+        registry=registry,
+        routing=routing,
+        router=Router(routing, registry),
+        keystore=KeyStore.from_file(settings.keys_file),
+        pricing=Pricing.from_file(settings.pricing_file),
+        loaded_at=time.time(),
+    )
 
 
 def openai_error(status_code: int, message: str, err_type: str, headers: Optional[dict] = None) -> JSONResponse:
@@ -63,46 +115,111 @@ def openai_error(status_code: int, message: str, err_type: str, headers: Optiona
     )
 
 
-def make_embedder(client: httpx.AsyncClient, registry: ProviderRegistry, embed_model: str):
+def upstream_body(body: dict[str, Any]) -> dict[str, Any]:
+    """The caller's body minus gateway-only fields."""
+    return {k: v for k, v in body.items() if k not in GATEWAY_ONLY_FIELDS}
+
+
+def client_status(err: UpstreamError) -> int:
+    """HTTP status the caller sees for an upstream failure.
+
+    The executor already turns exhausted chains into 502 (or 503 when every
+    circuit is open) and passes caller errors (400/413/422) through. Upstream
+    auth failures are the gateway's problem, not the caller's: surfacing them
+    as 401/403 would make the OpenAI SDK report the caller's own gateway key
+    as invalid, so they are mapped to 502 defensively.
+    """
+    if err.status_code in (401, 403) or (err.status_code >= 500 and err.status_code != 503):
+        return 502
+    return err.status_code
+
+
+def upstream_error_response(err: UpstreamError, headers: dict[str, str]) -> JSONResponse:
+    headers = dict(headers)
+    if err.attempts:
+        headers["X-Gateway-Attempts"] = summarize_attempts(err.attempts)
+    status = client_status(err)
+    if status == 503 and err.retry_after is not None:
+        headers["Retry-After"] = str(retry_after_header(err.retry_after))
+    return openai_error(status, err.message, "upstream_error", headers)
+
+
+def served_headers(result: FallbackResult) -> dict[str, str]:
+    target: Target = result.target
+    return {
+        "X-Gateway-Provider": target.provider.name,
+        "X-Upstream-Model": target.upstream_model,
+        "X-Gateway-Attempts": result.summary,
+    }
+
+
+def make_embedder(
+    client: httpx.AsyncClient,
+    registry: Union[ProviderRegistry, Callable[[], ProviderRegistry]],
+    embed_model: str,
+):
+    """The cache's embedder. ``registry`` may be a callable (read per call, so a
+    config reload is picked up). ``local/hash`` needs no provider at all."""
+    if embed_model == LOCAL_HASH_MODEL:
+        async def local_embed(text: str) -> list[float]:
+            return hash_embedding(text)
+
+        return local_embed
+
+    current = registry if callable(registry) else (lambda: registry)
+
     async def embed(text: str) -> list[float]:
-        target = registry.resolve(embed_model)
-        payload = {"model": target.upstream_model, "input": text}
-        data = await post_embeddings(client, target.provider, payload)
+        target = current().resolve(embed_model)
+        data = await post_embeddings(client, target.provider, target.payload({"input": text}))
         return data["data"][0]["embedding"]
 
     return embed
 
 
-def build_app(settings: Optional[Settings] = None) -> FastAPI:
+def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.AsyncBaseTransport] = None) -> FastAPI:
+    """Build the gateway app.
+
+    ``transport`` replaces the network layer of the shared upstream client (and
+    of the cache embedder, which uses the same client). Tests pass an
+    ``httpx.MockTransport`` here, the demo an ``OfflineGuardTransport``;
+    production leaves it ``None``. Either way, ``type: mock`` providers are
+    served in-process by ``GatewayTransport`` and never reach ``transport``.
+    """
     settings = settings or Settings.from_env()
 
     from .db import Database
 
+    initial = load_config(settings)
     db = Database(settings.db_path)
-    registry = ProviderRegistry.from_file(settings.providers_file)
-    routing = RoutingConfig.from_file(settings.routing_file)
-    router = Router(routing, registry)
-    keystore = KeyStore.from_file(settings.keys_file)
-    pricing = Pricing.from_file(settings.pricing_file)
-    accounting = Accounting(db, pricing)
+    accounting = Accounting(db, initial.pricing)
     limiter = RateLimiter()
+    breaker = CircuitBreaker(settings.breaker_failure_threshold, settings.breaker_cooldown_seconds)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
-        embedder = make_embedder(client, registry, settings.embed_model)
+        gateway_transport = GatewayTransport(transport, build_mocks(current().registry))
+        client = httpx.AsyncClient(timeout=settings.request_timeout_seconds, transport=gateway_transport)
         cache = SemanticCache(
             db,
-            embedder,
+            make_embedder(client, lambda: current().registry, settings.embed_model),
             ttl_seconds=settings.cache_ttl_seconds,
             similarity_threshold=settings.cache_similarity_threshold,
             semantic_enabled=settings.semantic_cache_enabled,
+            max_entries=settings.cache_max_entries,
+            maintenance_interval_seconds=settings.cache_purge_interval_seconds,
         )
+        cache.maintain()
         app.state.client = client
+        app.state.transport = gateway_transport
         app.state.cache = cache
+        for problem in validate_config(settings):
+            (logger.error if problem.level == ERROR else logger.warning)("config: %s", problem)
+        if settings.admin_token is None:
+            logger.warning("ADMIN_TOKEN is not set: /admin/* is open to anyone who can reach this port")
+        cfg = current()
         logger.info(
             "gateway ready: %d providers, %d models, %d keys",
-            len(registry.providers), len(registry.models), len(keystore),
+            len(cfg.registry.providers), len(cfg.registry.models), len(cfg.keystore),
         )
         try:
             yield
@@ -110,21 +227,47 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
             await client.aclose()
             db.close()
 
-    app = FastAPI(title="llm-gateway", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="llm-gateway", version=__version__, lifespan=lifespan)
     app.state.settings = settings
-    app.state.registry = registry
-    app.state.router = router
-    app.state.keystore = keystore
     app.state.accounting = accounting
     app.state.limiter = limiter
+    app.state.breaker = breaker
+
+    def current() -> GatewayConfig:
+        return app.state.config
+
+    def apply_config(cfg: GatewayConfig) -> None:
+        """Make ``cfg`` live. Requests read ``app.state.config`` once, at entry."""
+        app.state.config = cfg
+        # Kept for code that reads the pieces directly.
+        app.state.registry = cfg.registry
+        app.state.router = cfg.router
+        app.state.keystore = cfg.keystore
+        accounting.pricing = cfg.pricing
+        gateway_transport: Optional[GatewayTransport] = getattr(app.state, "transport", None)
+        if gateway_transport is not None:
+            gateway_transport.set_mocks(build_mocks(cfg.registry))
+
+    apply_config(initial)
+
+
+    async def run_chain(chain: list[Target], attempt) -> FallbackResult:
+        return await execute_with_fallback(
+            chain, attempt,
+            max_retries_per_target=settings.max_retries_per_target,
+            backoff_base=settings.backoff_base_seconds,
+            backoff_cap=settings.backoff_cap_seconds,
+            target_name=lambda t: t.name,
+            breaker=breaker,
+        )
 
     # ------------------------------------------------------------------ auth
-    def authenticate(request: Request) -> VirtualKey:
+    def authenticate(cfg: GatewayConfig, request: Request) -> VirtualKey:
         if not settings.require_auth:
             return VirtualKey(name="anonymous", key_hash="", rpm=6000, monthly_budget_usd=None)
         header = request.headers.get("authorization", "")
         token = header[7:].strip() if header.lower().startswith("bearer ") else header.strip()
-        key = keystore.authenticate(token)
+        key = cfg.keystore.authenticate(token)
         if key is None:
             raise GatewayError(401, "invalid gateway API key", "authentication_error")
         return key
@@ -133,63 +276,85 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
         rate = limiter.check(key.name, key.rpm)
         headers = rate.headers()
         if not rate.allowed:
-            raise GatewayError(429, f"rate limit exceeded for key '{key.name}'", "rate_limit_error")
+            raise GatewayError(
+                429, f"rate limit exceeded for key '{key.name}'", "rate_limit_error", headers,
+            )
         spent = accounting.month_cost(key.name)
-        budget = check_budget(spent, key.monthly_budget_usd)
+        budget = check_budget(spent, key.monthly_budget_usd, resets_at=next_month_start_epoch())
         headers.update(budget.headers())
         if not budget.allowed:
             raise GatewayError(
                 402,
                 f"monthly budget of ${key.monthly_budget_usd:.2f} exhausted for key '{key.name}'",
                 "budget_exceeded",
+                headers,
             )
         return headers
 
-    def caching_allowed(route, body: dict[str, Any]) -> tuple[bool, bool]:
+    def require_admin(request: Request) -> None:
+        token = settings.admin_token
+        if token and not hmac.compare_digest(
+            request.headers.get("x-admin-token", "").encode("utf-8"), token.encode("utf-8")
+        ):
+            raise GatewayError(401, "invalid admin token", "authentication_error")
+
+    def caching_allowed(route: ModelRoute, body: dict[str, Any]) -> tuple[bool, bool]:
         exact = settings.cache_enabled and route.cache and body.get("cache") is not False
         semantic = (
             exact
             and settings.semantic_cache_enabled
             and route.semantic_cache
             and not body.get("tools")
+            and not body.get("functions")
             and (body.get("n") in (None, 1))
         )
         return exact, semantic
 
+    async def read_body(request: Request) -> dict[str, Any]:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("the request body must be a JSON object")
+        return body
+
     # -------------------------------------------------------------- chat
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
+        cfg = current()
         try:
-            key = authenticate(request)
+            key = authenticate(cfg, request)
             limit_headers = enforce_limits(key)
-            body = await request.json()
+            body = await read_body(request)
             req = ChatCompletionRequest(**body)
         except GatewayError as err:
-            headers = err_headers(err)
-            return openai_error(err.status_code, err.message, err.err_type, headers)
+            return openai_error(err.status_code, err.message, err.err_type, err.headers)
         except (json.JSONDecodeError, ValueError, TypeError) as err:
             return openai_error(400, f"invalid request body: {err}", "invalid_request_error")
 
         # Routing.
-        gateway_model, decision = router.resolve_model(req.model, req.messages, req.wants_json())
+        gateway_model, decision = cfg.router.resolve_model(req.model, req.messages, req.wants_json())
         try:
-            route = registry.route(gateway_model)
+            route = cfg.registry.route(gateway_model)
         except UnknownModelError:
             return openai_error(404, f"model '{gateway_model}' is not configured", "model_not_found", limit_headers)
         if not key.allows_model(gateway_model):
-            return openai_error(403, f"key '{key.name}' is not allowed to use model '{gateway_model}'", "permission_error", limit_headers)
+            return openai_error(
+                403, f"key '{key.name}' is not allowed to use model '{gateway_model}'", "permission_error",
+                limit_headers,
+            )
 
         cache: SemanticCache = app.state.cache
         client: httpx.AsyncClient = app.state.client
         exact_ok, semantic_ok = caching_allowed(route, body)
+        wants_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
         # Cache lookup.
+        probe = CacheProbe(None)
         if exact_ok:
             try:
-                hit = await cache.lookup(gateway_model, body, allow_semantic=semantic_ok)
-            except Exception as exc:  # a failing embedder must not break the request
+                probe = await cache.probe(gateway_model, body, allow_semantic=semantic_ok)
+            except Exception as exc:  # noqa: BLE001 - the cache must never break a request
                 logger.warning("cache lookup failed: %s", exc)
-                hit = None
+            hit = probe.hit
             if hit is not None:
                 usage = hit.response.get("usage", {}) or {}
                 accounting.record(
@@ -205,149 +370,269 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
                 }
                 if req.stream:
                     return StreamingResponse(
-                        replay_stream(hit.response, gateway_model),
+                        replay_stream(hit.response, gateway_model, include_usage=wants_usage),
                         media_type="text/event-stream", headers=headers,
                     )
                 return JSONResponse(content=hit.response, headers=headers)
 
-        chain = router.resolve_chain(gateway_model)
+        chain = cfg.router.resolve_chain(gateway_model)
         base_headers = {**limit_headers, "X-Cache": "MISS", "X-Gateway-Model": gateway_model}
         if decision.get("reason") not in (None, "exact"):
             base_headers["X-Gateway-Route"] = decision.get("reason", "")
+        forward = upstream_body(body)
 
         if req.stream:
+            # Open the upstream stream (with retries and failover) *before*
+            # answering, so a dead chain is a proper HTTP error and the headers
+            # can name the provider that is actually streaming.
+            async def open_attempt(target: Target) -> httpx.Response:
+                return await open_chat_stream(client, target.provider, target.payload(forward))
+
+            try:
+                opened = await run_chain(chain, open_attempt)
+            except UpstreamError as err:
+                return upstream_error_response(err, base_headers)
             return StreamingResponse(
-                stream_and_account(
-                    app, client, chain, body, gateway_model, key, exact_ok, semantic_ok,
+                relay_stream(
+                    app, opened.value, opened.target, body, gateway_model, key,
+                    exact_ok, semantic_ok, probe, wants_usage,
                 ),
-                media_type="text/event-stream", headers=base_headers,
+                media_type="text/event-stream", headers={**base_headers, **served_headers(opened)},
             )
 
         async def attempt(target: Target) -> dict[str, Any]:
-            return await post_chat(client, target.provider, {**body, "model": target.upstream_model})
+            return await post_chat(client, target.provider, target.payload(forward))
 
         try:
-            result = await execute_with_fallback(
-                chain, attempt,
-                max_retries_per_target=settings.max_retries_per_target,
-                backoff_base=settings.backoff_base_seconds,
-                backoff_cap=settings.backoff_cap_seconds,
-                target_name=lambda t: f"{t.provider.name}:{t.upstream_model}",
-            )
+            result = await run_chain(chain, attempt)
         except UpstreamError as err:
-            status = 502 if err.status_code >= 500 else err.status_code
-            return openai_error(status, err.message, "upstream_error", base_headers)
+            return upstream_error_response(err, base_headers)
 
         data = result.value
         used: Target = result.target
         usage = data.get("usage") or {}
         prompt_tokens = int(usage.get("prompt_tokens") or approx_tokens(_prompt_text(req)))
         completion_tokens = int(usage.get("completion_tokens") or approx_tokens(_completion_text(data)))
+        # Bill the model that actually answered (a failover may land on a free one).
         accounting.record(
-            virtual_key=key.name, model=gateway_model, provider=used.provider.name,
+            virtual_key=key.name, model=used.gateway_model, provider=used.provider.name,
             endpoint="chat", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached=False,
         )
         if exact_ok:
-            try:
-                await cache.store(gateway_model, body, data, allow_semantic=semantic_ok)
-            except Exception as exc:
-                logger.warning("cache store failed: %s", exc)
+            await _store_in_cache(cache, gateway_model, body, data, semantic_ok, probe)
 
-        headers = {**base_headers, "X-Gateway-Provider": used.provider.name, "X-Upstream-Model": used.upstream_model}
-        return JSONResponse(content=data, headers=headers)
+        return JSONResponse(content=data, headers={**base_headers, **served_headers(result)})
 
     # ---------------------------------------------------------- embeddings
     @app.post("/v1/embeddings")
     async def embeddings(request: Request):
+        cfg = current()
         try:
-            key = authenticate(request)
+            key = authenticate(cfg, request)
             limit_headers = enforce_limits(key)
-            body = await request.json()
+            body = await read_body(request)
             req = EmbeddingRequest(**body)
         except GatewayError as err:
-            return openai_error(err.status_code, err.message, err.err_type, err_headers(err))
+            return openai_error(err.status_code, err.message, err.err_type, err.headers)
         except (json.JSONDecodeError, ValueError, TypeError) as err:
             return openai_error(400, f"invalid request body: {err}", "invalid_request_error")
 
-        model = routing.aliases.get(req.model, req.model)
+        model = cfg.routing.aliases.get(req.model, req.model)
         try:
-            registry.route(model)
+            cfg.registry.route(model)
         except UnknownModelError:
             return openai_error(404, f"model '{model}' is not configured", "model_not_found", limit_headers)
         if not key.allows_model(model):
-            return openai_error(403, f"key '{key.name}' is not allowed to use model '{model}'", "permission_error", limit_headers)
+            return openai_error(
+                403, f"key '{key.name}' is not allowed to use model '{model}'", "permission_error", limit_headers,
+            )
 
         client: httpx.AsyncClient = app.state.client
-        chain = router.resolve_chain(model)
+        chain = cfg.router.resolve_chain(model)
+        forward = upstream_body(body)
 
         async def attempt(target: Target) -> dict[str, Any]:
-            return await post_embeddings(client, target.provider, {**body, "model": target.upstream_model})
+            return await post_embeddings(client, target.provider, target.payload(forward))
 
         try:
-            result = await execute_with_fallback(
-                chain, attempt,
-                max_retries_per_target=settings.max_retries_per_target,
-                backoff_base=settings.backoff_base_seconds,
-                backoff_cap=settings.backoff_cap_seconds,
-                target_name=lambda t: f"{t.provider.name}:{t.upstream_model}",
-            )
+            result = await run_chain(chain, attempt)
         except UpstreamError as err:
-            status = 502 if err.status_code >= 500 else err.status_code
-            return openai_error(status, err.message, "upstream_error", limit_headers)
+            return upstream_error_response(err, {**limit_headers, "X-Gateway-Model": model})
 
         data = result.value
         used: Target = result.target
         usage = data.get("usage") or {}
         prompt_tokens = int(usage.get("prompt_tokens") or approx_tokens(_embed_input_text(req)))
         accounting.record(
-            virtual_key=key.name, model=model, provider=used.provider.name,
+            virtual_key=key.name, model=used.gateway_model, provider=used.provider.name,
             endpoint="embeddings", prompt_tokens=prompt_tokens, completion_tokens=0, cached=False,
         )
-        return JSONResponse(content=data, headers={**limit_headers, "X-Gateway-Provider": used.provider.name})
+        # X-Gateway-Model names the model that produced the vectors: after a
+        # failover it differs from the requested one, and so may the dimensions.
+        return JSONResponse(content=data, headers={
+            **limit_headers, "X-Gateway-Model": used.gateway_model, **served_headers(result),
+        })
 
     # -------------------------------------------------------------- models
     @app.get("/v1/models")
-    async def list_models():
-        data = [{"id": m, "object": "model", "owned_by": "gateway"} for m in registry.list_models()]
-        data.append({"id": "auto", "object": "model", "owned_by": "gateway"})
-        for alias in routing.aliases:
-            data.append({"id": alias, "object": "model", "owned_by": "gateway"})
+    async def list_models(request: Request):
+        """Models this key may call: concrete ids, ``auto`` and aliases."""
+        cfg = current()
+        try:
+            key = authenticate(cfg, request)
+        except GatewayError as err:
+            return openai_error(err.status_code, err.message, err.err_type, err.headers)
+        ids = [m for m in cfg.registry.list_models() if key.allows_model(m)]
+        auto = cfg.routing.auto
+        if key.allows_model(auto.cheap_model) and key.allows_model(auto.strong_model):
+            ids.append("auto")
+        ids += [alias for alias, target in cfg.routing.aliases.items() if key.allows_model(target)]
+        data = [{"id": m, "object": "model", "created": 0, "owned_by": "gateway"} for m in ids]
         return {"object": "list", "data": data}
 
     # --------------------------------------------------------------- admin
     @app.get("/admin/usage")
     async def admin_usage(request: Request):
-        admin_token = os.getenv("ADMIN_TOKEN")
-        if admin_token and request.headers.get("x-admin-token") != admin_token:
-            return openai_error(401, "invalid admin token", "authentication_error")
+        try:
+            require_admin(request)
+        except GatewayError as err:
+            return openai_error(err.status_code, err.message, err.err_type)
         summary = accounting.summary()
+        cache: Optional[SemanticCache] = getattr(app.state, "cache", None)
+        if cache is not None:
+            summary["cache"] = cache.stats()
         want_json = request.query_params.get("format") == "json" or "application/json" in request.headers.get("accept", "")
         if want_json:
             return JSONResponse(summary)
         return HTMLResponse(render_usage_html(summary))
 
+    @app.get("/admin/health")
+    async def admin_health(request: Request):
+        try:
+            require_admin(request)
+        except GatewayError as err:
+            return openai_error(err.status_code, err.message, err.err_type)
+        cfg = current()
+        targets: dict[str, dict[str, Any]] = {}
+        for model in cfg.registry.list_models():
+            target = cfg.registry.resolve(model)
+            targets.setdefault(target.name, {"state": "closed", "consecutive_failures": 0,
+                                             "successes": 0, "failures": 0, "last_status": None,
+                                             "last_error": None, "last_error_at": None,
+                                             "last_success_at": None, "retry_in_seconds": 0.0})
+        targets.update(breaker.snapshot())
+        unhealthy = sorted(name for name, t in targets.items() if t["state"] != "closed")
+        return {
+            "status": "degraded" if unhealthy else "ok",
+            "unhealthy_targets": unhealthy,
+            "config_loaded_at": cfg.loaded_at,
+            "breaker": {
+                "enabled": breaker.enabled,
+                "failure_threshold": breaker.failure_threshold,
+                "cooldown_seconds": breaker.cooldown_seconds,
+            },
+            "providers": {
+                name: {"type": p.type, "base_url": p.base_url, "api_key_set": p.api_key() is not None}
+                for name, p in cfg.registry.providers.items()
+            },
+            "targets": targets,
+        }
+
+    @app.post("/admin/reload")
+    async def admin_reload(request: Request):
+        """Re-read providers/routing/keys/pricing and swap them in atomically.
+
+        The new files are validated first; with any error the running config
+        is kept and the problems are returned. In-flight requests finish on the
+        config they started with. Rate-limit buckets, the breaker, the cache
+        and the ledger are preserved.
+        """
+        try:
+            require_admin(request)
+        except GatewayError as err:
+            return openai_error(err.status_code, err.message, err.err_type)
+        problems = validate_config(settings)
+        errors = [p for p in problems if p.level == ERROR]
+        if errors:
+            return JSONResponse(status_code=400, content={
+                "error": {"message": f"config not reloaded: {len(errors)} error(s)", "type": "invalid_config",
+                          "code": 400},
+                "problems": [p.to_dict() for p in problems],
+            })
+        try:
+            cfg = load_config(settings)
+        except (ConfigError, OSError, ValueError, KeyError, TypeError) as exc:
+            return openai_error(400, f"config not reloaded: {exc}", "invalid_config")
+        apply_config(cfg)
+        logger.info("config reloaded: %d providers, %d models, %d keys",
+                    len(cfg.registry.providers), len(cfg.registry.models), len(cfg.keystore))
+        return {
+            "status": "reloaded",
+            "loaded_at": cfg.loaded_at,
+            "providers": len(cfg.registry.providers),
+            "models": len(cfg.registry.models),
+            "keys": len(cfg.keystore),
+            "warnings": [p.to_dict() for p in problems],
+        }
+
     @app.get("/healthz")
     async def healthz():
-        return {"status": "ok", "providers": len(registry.providers), "models": len(registry.models)}
+        cfg = current()
+        return {"status": "ok", "providers": len(cfg.registry.providers), "models": len(cfg.registry.models)}
 
     @app.get("/")
     async def root():
         return {
             "name": "llm-gateway",
+            "version": __version__,
             "docs": "/docs",
-            "endpoints": ["/v1/chat/completions", "/v1/embeddings", "/v1/models", "/admin/usage"],
+            "endpoints": ["/v1/chat/completions", "/v1/embeddings", "/v1/models", "/admin/usage",
+                          "/admin/health", "/admin/reload"],
         }
 
     return app
 
 
-def err_headers(err: GatewayError) -> dict[str, str]:
-    if err.status_code == 429:
-        return {"Retry-After": "1"}
-    return {}
+def create_app() -> FastAPI:
+    """App factory for ``uvicorn --factory app.main:create_app`` (config from env)."""
+    return build_app(Settings.from_env())
+
+
+_default_app: Optional[FastAPI] = None
+
+
+def __getattr__(name: str) -> Any:
+    """Build the module-level ``app`` on first access (``uvicorn app.main:app``).
+
+    Importing ``app.main`` therefore never reads config files or creates a
+    database; only asking for ``app.main.app`` does.
+    """
+    global _default_app
+    if name == "app":
+        if _default_app is None:
+            _default_app = create_app()
+        return _default_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ------------------------------------------------------------- helpers
+
+
+async def _store_in_cache(
+    cache: SemanticCache,
+    model: str,
+    body: dict[str, Any],
+    response: dict[str, Any],
+    semantic_ok: bool,
+    probe: CacheProbe,
+) -> None:
+    try:
+        await cache.store(
+            model, body, response, allow_semantic=semantic_ok,
+            vector=probe.vector, embed=not probe.embed_failed,
+        )
+    except Exception as exc:  # noqa: BLE001 - caching is best effort
+        logger.warning("cache store failed: %s", exc)
 
 
 def _prompt_text(req: ChatCompletionRequest) -> str:
@@ -371,92 +656,113 @@ def _embed_input_text(req: EmbeddingRequest) -> str:
     return str(req.input)
 
 
-async def replay_stream(response: dict[str, Any], model: str):
-    """Turn a cached full completion back into a minimal SSE stream."""
-    content = _completion_text(response)
+def _sse(obj: Any) -> bytes:
+    return f"data: {json.dumps(obj)}\n\n".encode("utf-8")
+
+
+async def replay_stream(response: dict[str, Any], model: str, include_usage: bool = False):
+    """Turn a cached full completion back into an OpenAI-shaped SSE stream."""
     completion_id = response.get("id", "chatcmpl-cache")
-    first = {
-        "id": completion_id, "object": "chat.completion.chunk", "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-    }
-    yield f"data: {json.dumps(first)}\n\n".encode("utf-8")
-    body = {
-        "id": completion_id, "object": "chat.completion.chunk", "model": model,
-        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-    }
-    yield f"data: {json.dumps(body)}\n\n".encode("utf-8")
-    last = {
-        "id": completion_id, "object": "chat.completion.chunk", "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    }
-    yield f"data: {json.dumps(last)}\n\n".encode("utf-8")
+    created = int(response.get("created") or time.time())
+
+    def chunk(choices: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+        return {
+            "id": completion_id, "object": "chat.completion.chunk", "created": created,
+            "model": model, "choices": choices, **extra,
+        }
+
+    for choice in response.get("choices") or [{"index": 0, "message": {}}]:
+        index = choice.get("index", 0)
+        message = choice.get("message") or {}
+        yield _sse(chunk([{"index": index, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]))
+        if isinstance(message.get("content"), str) and message["content"]:
+            yield _sse(chunk([{"index": index, "delta": {"content": message["content"]}, "finish_reason": None}]))
+        if message.get("tool_calls"):
+            calls = [{**call, "index": i} for i, call in enumerate(message["tool_calls"])]
+            yield _sse(chunk([{"index": index, "delta": {"tool_calls": calls}, "finish_reason": None}]))
+        finish = choice.get("finish_reason") or "stop"
+        yield _sse(chunk([{"index": index, "delta": {}, "finish_reason": finish}]))
+    if include_usage:
+        yield _sse(chunk([], usage=response.get("usage") or {}))
     yield b"data: [DONE]\n\n"
 
 
-async def stream_and_account(
+async def relay_stream(
     app: FastAPI,
-    client: httpx.AsyncClient,
-    chain: list[Target],
+    resp: httpx.Response,
+    target: Target,
     body: dict[str, Any],
     gateway_model: str,
     key: VirtualKey,
     exact_ok: bool,
     semantic_ok: bool,
+    probe: CacheProbe,
+    wants_usage: bool,
 ):
-    """Stream from the first working target, then record usage and cache."""
+    """Relay an open upstream stream, then record usage and cache the answer.
+
+    The gateway always asks the upstream for a usage chunk (for accounting),
+    but only forwards it when the caller asked for one: the chunk has an empty
+    ``choices`` list, which clients that did not opt in do not expect. Usage is
+    recorded even if the client disconnects mid-stream, because the upstream
+    tokens were spent either way; only complete answers are cached.
+    """
     accounting: Accounting = app.state.accounting
     cache: SemanticCache = app.state.cache
+    breaker: CircuitBreaker = app.state.breaker
     accumulated: list[str] = []
     usage: dict[str, Any] = {}
-    used: Optional[Target] = None
-    started = False
-    last_error: Optional[UpstreamError] = None
-
-    for target in chain:
-        payload = {**body, "model": target.upstream_model}
+    saw_tool_calls = False
+    finish_reason: Optional[str] = None
+    completed = False
+    try:
         try:
-            async for chunk in stream_chat(client, target.provider, payload):
-                started = True
-                used = target
-                text, u = parse_sse_content(chunk.decode("utf-8", "replace").strip())
-                if text:
-                    accumulated.append(text)
-                if u:
-                    usage = u
+            async for chunk in iter_sse_lines(resp):
+                event = parse_sse_event(chunk.decode("utf-8", "replace").strip())
+                if event is not None:
+                    if event.get("usage"):
+                        usage = event["usage"]
+                    choices = event.get("choices")
+                    for choice in choices or []:
+                        if choice.get("index", 0) != 0:
+                            continue
+                        delta = choice.get("delta") or {}
+                        if isinstance(delta.get("content"), str):
+                            accumulated.append(delta["content"])
+                        if delta.get("tool_calls"):
+                            saw_tool_calls = True
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                    if choices == [] and "usage" in event and not wants_usage:
+                        continue
                 yield chunk
-            used = used or target
-            break
-        except UpstreamError as err:
-            last_error = err
-            if started or not err.retryable:
-                yield _sse_error(err)
-                return
-            continue
-    else:
-        if last_error is not None:
-            yield _sse_error(last_error)
-        return
+            completed = True
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            err = UpstreamError(504, f"{target.provider.name} stream interrupted: {exc!r}")
+            breaker.record_failure(target.name, err.status_code, err.message)
+            logger.warning("stream from %s interrupted: %r", target.name, exc)
+            yield _sse_error(err)
+    finally:
+        content = "".join(accumulated)
+        prompt_tokens = int(usage.get("prompt_tokens") or approx_tokens(
+            "\n".join(m.get("content", "") if isinstance(m.get("content"), str) else ""
+                      for m in body.get("messages", []))
+        ))
+        completion_tokens = int(usage.get("completion_tokens") or approx_tokens(content))
+        accounting.record(
+            virtual_key=key.name, model=target.gateway_model, provider=target.provider.name,
+            endpoint="chat", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached=False,
+        )
+        await resp.aclose()
 
-    content = "".join(accumulated)
-    prompt_tokens = int(usage.get("prompt_tokens") or approx_tokens(
-        "\n".join(m.get("content", "") if isinstance(m.get("content"), str) else "" for m in body.get("messages", []))
-    ))
-    completion_tokens = int(usage.get("completion_tokens") or approx_tokens(content))
-    provider_name = used.provider.name if used else (chain[0].provider.name if chain else "unknown")
-    accounting.record(
-        virtual_key=key.name, model=gateway_model, provider=provider_name,
-        endpoint="chat", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached=False,
-    )
-    if exact_ok and content:
+    if completed and exact_ok and content and not saw_tool_calls and body.get("n") in (None, 1):
         response = build_chat_response(
             gateway_model, content,
             {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
              "total_tokens": prompt_tokens + completion_tokens},
+            finish_reason=finish_reason or "stop",
         )
-        try:
-            await cache.store(gateway_model, body, response, allow_semantic=semantic_ok)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("cache store failed: %s", exc)
+        await _store_in_cache(cache, gateway_model, body, response, semantic_ok, probe)
 
 
 def _sse_error(err: UpstreamError) -> bytes:
@@ -466,55 +772,77 @@ def _sse_error(err: UpstreamError) -> bytes:
 
 def render_usage_html(summary: dict[str, Any]) -> str:
     totals = summary.get("totals", {})
+    cache = summary.get("cache") or {}
 
     def rows(items: list[dict], columns: list[tuple[str, str]]) -> str:
         out = []
         for item in items:
-            cells = "".join(f"<td>{_fmt(item.get(col))}</td>" for col, _ in columns)
+            cells = "".join(
+                f'<td{" class=num" if col not in ("virtual_key", "model", "provider") else ""}>'
+                f"{html.escape(_fmt(item.get(col)))}</td>"
+                for col, _ in columns
+            )
             out.append(f"<tr>{cells}</tr>")
-        return "".join(out)
+        return "".join(out) or f'<tr><td colspan="{len(columns)}">No requests yet.</td></tr>'
 
     key_cols = [("virtual_key", "Key"), ("requests", "Requests"), ("total_tokens", "Tokens"),
-                ("cache_hits", "Cache hits"), ("cost_usd", "Cost USD")]
+                ("cache_hits", "Cache hits"), ("cost_usd", "Cost USD"), ("saved_usd", "Saved USD")]
     model_cols = [("model", "Model"), ("provider", "Provider"), ("requests", "Requests"),
-                  ("total_tokens", "Tokens"), ("cache_hits", "Cache hits"), ("cost_usd", "Cost USD")]
+                  ("total_tokens", "Tokens"), ("cache_hits", "Cache hits"), ("cost_usd", "Cost USD"),
+                  ("saved_usd", "Saved USD")]
+    requests = totals.get("requests") or 0
+    hit_rate = f"{100 * (totals.get('cache_hits') or 0) / requests:.0f}%" if requests else "0%"
+    cache_note = (
+        f"<p class=note>Cache: {_fmt(cache.get('entries'))} entries "
+        f"({_fmt(cache.get('semantic_entries'))} with embeddings), cap {_fmt(cache.get('max_entries'))}, "
+        f"TTL {_fmt(cache.get('ttl_seconds'))} s, similarity threshold {cache.get('similarity_threshold')}.</p>"
+        if cache else ""
+    )
 
     return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>llm-gateway usage</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-gateway usage</title>
 <style>
- body{{font-family:ui-sans-serif,system-ui,sans-serif;margin:2rem;color:#18181b;background:#fafafa}}
- h1{{font-size:1.4rem}} h2{{font-size:1.05rem;margin-top:2rem;color:#3f3f46}}
- table{{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.06);border-radius:8px;overflow:hidden}}
- th,td{{padding:.55rem .8rem;text-align:left;border-bottom:1px solid #f1f1f4;font-size:.9rem}}
- th{{background:#f4f4f5;font-weight:600}} .kpi{{display:flex;gap:1rem;flex-wrap:wrap}}
- .card{{background:#fff;border:1px solid #ececf0;border-radius:10px;padding:1rem 1.2rem;min-width:140px}}
- .card b{{display:block;font-size:1.5rem;color:#2563eb}} .card span{{color:#71717a;font-size:.8rem}}
-</style></head><body>
+ :root{{--bg:#fafafa;--fg:#18181b;--muted:#71717a;--card:#fff;--line:#ececf0;--head:#f4f4f5;--accent:#2563eb;--good:#15803d}}
+ @media (prefers-color-scheme: dark){{:root{{--bg:#0f0f12;--fg:#e4e4e7;--muted:#a1a1aa;--card:#18181b;--line:#27272a;--head:#1f1f23;--accent:#60a5fa;--good:#4ade80}}}}
+ body{{font-family:ui-sans-serif,system-ui,sans-serif;margin:0;padding:2rem 1rem;color:var(--fg);background:var(--bg)}}
+ main{{max-width:1100px;margin:0 auto}}
+ h1{{font-size:1.4rem;margin:0 0 1rem}} h2{{font-size:1.05rem;margin-top:2rem;color:var(--muted)}}
+ .scroll{{overflow-x:auto;border:1px solid var(--line);border-radius:8px}}
+ table{{border-collapse:collapse;width:100%;background:var(--card);min-width:560px}}
+ th,td{{padding:.55rem .8rem;text-align:left;border-bottom:1px solid var(--line);font-size:.9rem}}
+ th{{background:var(--head);font-weight:600}} td.num{{font-variant-numeric:tabular-nums}}
+ .kpi{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1rem}}
+ .card{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:1rem 1.2rem}}
+ .card b{{display:block;font-size:1.5rem;color:var(--accent)}} .card span{{color:var(--muted);font-size:.8rem}}
+ .card.saved b{{color:var(--good)}} .note{{color:var(--muted);font-size:.85rem}}
+</style></head><body><main>
 <h1>llm-gateway usage</h1>
 <div class="kpi">
  <div class="card"><b>{_fmt(totals.get('requests'))}</b><span>requests</span></div>
  <div class="card"><b>{_fmt(totals.get('total_tokens'))}</b><span>tokens</span></div>
- <div class="card"><b>{_fmt(totals.get('cache_hits'))}</b><span>cache hits</span></div>
+ <div class="card"><b>{_fmt(totals.get('cache_hits'))}</b><span>cache hits ({hit_rate})</span></div>
  <div class="card"><b>${_fmt(totals.get('cost_usd'))}</b><span>upstream cost</span></div>
+ <div class="card saved"><b>${_fmt(totals.get('saved_usd'))}</b><span>saved by the cache</span></div>
 </div>
+{cache_note}
 <h2>By key</h2>
-<table><thead><tr>{''.join(f'<th>{label}</th>' for _, label in key_cols)}</tr></thead>
-<tbody>{rows(summary.get('by_key', []), key_cols)}</tbody></table>
+<div class="scroll"><table><thead><tr>{''.join(f'<th>{label}</th>' for _, label in key_cols)}</tr></thead>
+<tbody>{rows(summary.get('by_key', []), key_cols)}</tbody></table></div>
 <h2>By model</h2>
-<table><thead><tr>{''.join(f'<th>{label}</th>' for _, label in model_cols)}</tr></thead>
-<tbody>{rows(summary.get('by_model', []), model_cols)}</tbody></table>
-</body></html>"""
+<div class="scroll"><table><thead><tr>{''.join(f'<th>{label}</th>' for _, label in model_cols)}</tr></thead>
+<tbody>{rows(summary.get('by_model', []), model_cols)}</tbody></table></div>
+<p class="note">Saved USD prices each cache hit's recorded tokens at the current pricing.json rates.</p>
+</main></body></html>"""
 
 
 def _fmt(value: Any) -> str:
     if value is None:
         return "0"
     if isinstance(value, float):
-        return f"{value:,.4f}" if value < 1 else f"{value:,.2f}"
+        if value == 0:
+            return "0"
+        return f"{value:,.6f}" if value < 0.01 else (f"{value:,.4f}" if value < 1 else f"{value:,.2f}")
     if isinstance(value, int):
         return f"{value:,}"
     return str(value)
-
-
-# Module-level app for ``uvicorn app.main:app``.
-app = build_app()

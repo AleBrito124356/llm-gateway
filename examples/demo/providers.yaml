@@ -1,0 +1,62 @@
+# Offline demo configuration: every provider is `type: mock`, answered
+# in-process by app/mock.py. No API key, no network, no cost.
+#
+#   python -m app demo                                    # scripted walkthrough
+#   CONFIG_DIR=examples/demo uvicorn app.main:app --port 8000   # a real server
+#
+# The model ids mirror the real config (providers.yaml at the repo root), so
+# client_example.py and any OpenAI SDK code work against this unchanged.
+
+providers:
+  # Stands in for NVIDIA NIM: healthy, a little latency, visible streaming.
+  mock-nim:
+    type: mock
+    latency_ms: 20
+    stream_delay_ms: 15
+
+  # Stands in for a local Ollama: the failover target.
+  mock-ollama:
+    type: mock
+
+  # A provider in a full outage: every call is a 503 (retried, then failed
+  # over; after BREAKER_FAILURE_THRESHOLD failures its circuit opens).
+  mock-outage:
+    type: mock
+    fail_status: 503
+
+  # A provider whose key was revoked: 401, failed over at once, never retried.
+  mock-revoked:
+    type: mock
+    fail_status: 401
+
+  # A provider with a single transient hiccup: the first call is a 503 with
+  # Retry-After: 0, the retry on the same target succeeds.
+  mock-hiccup:
+    type: mock
+    fail_status: 503
+    fail_first_n: 1
+    retry_after: 0
+
+models:
+  meta/llama-3.3-70b-instruct:
+    provider: mock-nim
+  meta/llama-3.1-8b-instruct:
+    provider: mock-nim
+  nvidia/nv-embedqa-e5-v5:
+    provider: mock-nim
+    extra_body:
+      input_type: query
+  ollama/llama3.1:
+    provider: mock-ollama
+    upstream_model: llama3.1
+    semantic_cache: false
+
+  demo/outage:
+    provider: mock-outage
+    upstream_model: llama-3.3-70b-instruct
+  demo/revoked-key:
+    provider: mock-revoked
+    upstream_model: llama-3.3-70b-instruct
+  demo/hiccup:
+    provider: mock-hiccup
+    upstream_model: llama-3.3-70b-instruct

@@ -29,7 +29,8 @@ providers:
     api_key_env: TOGETHER_API_KEY
     timeout: 60
 
-# Gateway model id -> provider (+ optional upstream_model, cache toggles).
+# Gateway model id -> provider (+ optional upstream_model, cache toggles and
+# extra_body: provider-specific fields merged into every upstream call).
 models:
   meta/llama-3.3-70b-instruct:
     provider: nvidia
@@ -40,6 +41,14 @@ models:
   # Embedding model used for both /v1/embeddings and the semantic cache.
   nvidia/nv-embedqa-e5-v5:
     provider: nvidia
+    # NVIDIA's retrieval embedders are asymmetric and reject requests without
+    # input_type. extra_body is merged *under* the caller's body, so a client
+    # embedding documents can still send "input_type": "passage". The semantic
+    # cache compares queries with queries, so "query" is right for it.
+    # truncate: END keeps long prompts from failing the cache embedder.
+    extra_body:
+      input_type: query
+      truncate: END
 
   # Local Ollama models. Handy as failover targets when NIM has an outage.
   ollama/llama3.1:

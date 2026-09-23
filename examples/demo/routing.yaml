@@ -1,0 +1,35 @@
+# Same shape as the real routing.yaml, pointed at the mock models.
+
+auto:
+  long_prompt_chars: 2000
+  models:
+    cheap: meta/llama-3.1-8b-instruct
+    strong: meta/llama-3.3-70b-instruct
+  rules:
+    - if: code
+      use: strong
+    - if: json_mode
+      use: strong
+    - if: long_prompt
+      use: strong
+    - if: default
+      use: cheap
+
+aliases:
+  gpt-3.5-turbo: meta/llama-3.1-8b-instruct
+  gpt-4: meta/llama-3.3-70b-instruct
+  gpt-4o: meta/llama-3.3-70b-instruct
+  text-embedding-3-small: nvidia/nv-embedqa-e5-v5
+
+fallbacks:
+  meta/llama-3.3-70b-instruct:
+    - meta/llama-3.1-8b-instruct
+    - ollama/llama3.1
+  meta/llama-3.1-8b-instruct:
+    - ollama/llama3.1
+  demo/outage:
+    - ollama/llama3.1
+  demo/revoked-key:
+    - ollama/llama3.1
+  demo/hiccup:
+    - ollama/llama3.1

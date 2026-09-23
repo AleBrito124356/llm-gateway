@@ -1,6 +1,6 @@
 """Two-layer cache: exact + semantic (embeddings mocked, no network)."""
 
-from app.cache import SemanticCache, estimated_savings, exact_key, semantic_text
+from app.cache import SemanticCache, context_key, estimated_savings, exact_key, semantic_text
 from app.db import Database
 
 
@@ -90,7 +90,7 @@ def test_exact_key_is_stable_and_content_sensitive():
     assert exact_key("m", req("a")) != exact_key("other", req("a"))
 
 
-def test_semantic_text_uses_system_and_last_user():
+def test_semantic_text_is_the_final_user_turn():
     body = {
         "messages": [
             {"role": "system", "content": "be terse"},
@@ -99,10 +99,75 @@ def test_semantic_text_uses_system_and_last_user():
             {"role": "user", "content": "second"},
         ]
     }
-    text = semantic_text(body)
-    assert "be terse" in text
-    assert "second" in text
-    assert "first" not in text
+    # The system prompt and earlier turns are pinned by context_key instead.
+    assert semantic_text(body) == "second"
+    assert semantic_text({"messages": [{"role": "system", "content": "only system"}]}) == ""
+    multimodal = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "describe"}, {"type": "image_url", "image_url": {"url": "x"}},
+        {"type": "text", "text": "this"},
+    ]}]}
+    assert semantic_text(multimodal) == "describe this"
+
+
+def test_context_key_ignores_only_the_final_user_text():
+    base = [{"role": "system", "content": "s"}, {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"}]
+    k1 = context_key("m", {"messages": base + [{"role": "user", "content": "follow up"}]})
+    k2 = context_key("m", {"messages": base + [{"role": "user", "content": "a different follow up"}]})
+    assert k1 == k2
+    other_history = [{"role": "system", "content": "s"}, {"role": "user", "content": "q2"},
+                     {"role": "assistant", "content": "a1"}, {"role": "user", "content": "follow up"}]
+    assert context_key("m", {"messages": other_history}) != k1
+    body = {"messages": base + [{"role": "user", "content": "follow up"}]}
+    for field, value in [("response_format", {"type": "json_object"}), ("temperature", 0.9),
+                         ("max_tokens", 5), ("tools", [{"type": "function"}]), ("seed", 7)]:
+        assert context_key("m", {**body, field: value}) != k1, field
+    assert context_key("other-model", body) != k1
+    # Fields that do not shape the output do not split the context.
+    assert context_key("m", {**body, "user": "u1", "stream": True}) == k1
+
+
+async def test_semantic_hit_requires_identical_context():
+    cache = make_cache()
+    history = [{"role": "user", "content": "talk about Spain"}, {"role": "assistant", "content": "ok"}]
+    await cache.store("m", {"messages": history + [{"role": "user", "content": "France?"}]}, RESP, allow_semantic=True)
+    other = [{"role": "user", "content": "talk about cheese"}, {"role": "assistant", "content": "ok"}]
+    assert await cache.lookup("m", {"messages": other + [{"role": "user", "content": "France!"}]},
+                              allow_semantic=True) is None
+    hit = await cache.lookup("m", {"messages": history + [{"role": "user", "content": "France!"}]},
+                             allow_semantic=True)
+    assert hit is not None and hit.kind == "SEMANTIC"
+
+
+async def test_failing_embedder_degrades_to_exact_only():
+    calls = {"n": 0}
+
+    async def broken(text: str) -> list[float]:
+        calls["n"] += 1
+        raise RuntimeError("embedder down")
+
+    cache = SemanticCache(Database(":memory:"), broken, ttl_seconds=60, similarity_threshold=0.9)
+    probe = await cache.probe("m", req("hello"), allow_semantic=True)
+    assert probe.hit is None and probe.embed_failed
+    await cache.store("m", req("hello"), RESP, allow_semantic=True, embed=not probe.embed_failed)
+    assert calls["n"] == 1
+    await cache.store("m", req("other"), RESP, allow_semantic=True)  # store's own embed fails too
+    assert calls["n"] == 2
+    assert (await cache.lookup("m", req("other"), allow_semantic=False)).kind == "EXACT"
+
+
+async def test_probe_vector_is_reused_by_store():
+    calls = {"n": 0}
+
+    async def counting(text: str) -> list[float]:
+        calls["n"] += 1
+        return await topic_embedder(text)
+
+    cache = SemanticCache(Database(":memory:"), counting, ttl_seconds=60, similarity_threshold=0.9)
+    probe = await cache.probe("m", req("France"), allow_semantic=True)
+    await cache.store("m", req("France"), RESP, allow_semantic=True, vector=probe.vector)
+    assert calls["n"] == 1
+    assert cache.stats()["semantic_entries"] == 1
 
 
 def test_estimated_savings_math():
