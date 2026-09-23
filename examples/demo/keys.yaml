@@ -1,0 +1,31 @@
+# Demo virtual keys. The plaintexts are published on purpose: this config only
+# ever talks to in-process mock providers.
+
+keys:
+  # PLAINTEXT: sk-gw-demo-000-not-a-real-secret (same demo key as the real
+  # keys.yaml, so client_example.py works unchanged).
+  - name: demo
+    key_hash: db08fd09bef90acab8dd92fb2e3ee762d65248e412310a2b04a95deb1e970603
+    rpm: 600
+    monthly_budget_usd: 5.0
+    allowed_models: ["*"]
+
+  # PLAINTEXT: sk-gw-demo-burst-not-a-real-secret - 3 requests per minute.
+  - name: burst
+    key_hash: b803405e1666de6e1c531304245169b5f15bdfc913c64df57f2754d8b20f1f11
+    rpm: 3
+    allowed_models: ["*"]
+
+  # PLAINTEXT: sk-gw-demo-tiny-budget-not-a-real-secret - $0.0002 per month.
+  - name: tiny-budget
+    key_hash: 6f0641ab12a0bc50e9d9f931d9a795f508759eb501fb74cb78ebc4ac3b1c1c0e
+    rpm: 600
+    monthly_budget_usd: 0.0002
+    allowed_models: ["*"]
+
+  # PLAINTEXT: sk-gw-demo-cheap-only-not-a-real-secret - only the small model.
+  - name: cheap-only
+    key_hash: e06dbb2848623a4dcdaa00a60c1206d2d04933286dcc5b41e5d0b7f82e8e7ff4
+    rpm: 600
+    monthly_budget_usd: 1.0
+    allowed_models: ["meta/llama-3.1-8b-instruct", "nvidia/nv-embedqa-e5-v5"]

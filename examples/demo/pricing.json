@@ -1,0 +1,11 @@
+{
+  "_comment": "USD per 1,000,000 tokens. Same reference prices as the real pricing.json so the demo ledger and savings look realistic; the mock providers themselves cost nothing.",
+  "default": { "input_per_1m": 0.20, "output_per_1m": 0.20 },
+  "meta/llama-3.3-70b-instruct": { "input_per_1m": 0.90, "output_per_1m": 0.90 },
+  "meta/llama-3.1-8b-instruct": { "input_per_1m": 0.06, "output_per_1m": 0.06 },
+  "nvidia/nv-embedqa-e5-v5": { "input_per_1m": 0.02, "output_per_1m": 0.0 },
+  "ollama/llama3.1": { "input_per_1m": 0.0, "output_per_1m": 0.0 },
+  "demo/outage": { "input_per_1m": 0.90, "output_per_1m": 0.90 },
+  "demo/revoked-key": { "input_per_1m": 0.90, "output_per_1m": 0.90 },
+  "demo/hiccup": { "input_per_1m": 0.90, "output_per_1m": 0.90 }
+}

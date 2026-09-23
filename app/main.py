@@ -32,6 +32,7 @@ from .config import Settings
 from .fallback import CircuitBreaker, FallbackResult, UpstreamError, execute_with_fallback, summarize_attempts
 from .keys import KeyStore, VirtualKey
 from .limits import RateLimiter, check_budget, retry_after_header
+from .mock import LOCAL_HASH_MODEL, GatewayTransport, build_mocks, hash_embedding
 from .providers import ProviderRegistry, Target, UnknownModelError
 from .router import Router, RoutingConfig
 from .schemas import (
@@ -116,6 +117,12 @@ def served_headers(result: FallbackResult) -> dict[str, str]:
 
 
 def make_embedder(client: httpx.AsyncClient, registry: ProviderRegistry, embed_model: str):
+    if embed_model == LOCAL_HASH_MODEL:
+        async def local_embed(text: str) -> list[float]:
+            return hash_embedding(text)
+
+        return local_embed
+
     async def embed(text: str) -> list[float]:
         target = registry.resolve(embed_model)
         data = await post_embeddings(client, target.provider, target.payload({"input": text}))
@@ -129,7 +136,9 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
 
     ``transport`` replaces the network layer of the shared upstream client (and
     of the cache embedder, which uses the same client). Tests pass an
-    ``httpx.MockTransport`` here; production leaves it ``None``.
+    ``httpx.MockTransport`` here, the demo an ``OfflineGuardTransport``;
+    production leaves it ``None``. Either way, ``type: mock`` providers are
+    served in-process by ``GatewayTransport`` and never reach ``transport``.
     """
     settings = settings or Settings.from_env()
 
@@ -147,7 +156,8 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        client = httpx.AsyncClient(timeout=settings.request_timeout_seconds, transport=transport)
+        gateway_transport = GatewayTransport(transport, build_mocks(registry))
+        client = httpx.AsyncClient(timeout=settings.request_timeout_seconds, transport=gateway_transport)
         embedder = make_embedder(client, registry, settings.embed_model)
         cache = SemanticCache(
             db,
@@ -160,6 +170,7 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
         )
         cache.maintain()
         app.state.client = client
+        app.state.transport = gateway_transport
         app.state.cache = cache
         logger.info(
             "gateway ready: %d providers, %d models, %d keys",
@@ -335,7 +346,7 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
         prompt_tokens = int(usage.get("prompt_tokens") or approx_tokens(_prompt_text(req)))
         completion_tokens = int(usage.get("completion_tokens") or approx_tokens(_completion_text(data)))
         accounting.record(
-            virtual_key=key.name, model=gateway_model, provider=used.provider.name,
+            virtual_key=key.name, model=used.gateway_model, provider=used.provider.name,
             endpoint="chat", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached=False,
         )
         if exact_ok:
@@ -383,7 +394,7 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
         usage = data.get("usage") or {}
         prompt_tokens = int(usage.get("prompt_tokens") or approx_tokens(_embed_input_text(req)))
         accounting.record(
-            virtual_key=key.name, model=model, provider=used.provider.name,
+            virtual_key=key.name, model=used.gateway_model, provider=used.provider.name,
             endpoint="embeddings", prompt_tokens=prompt_tokens, completion_tokens=0, cached=False,
         )
         # X-Gateway-Model names the model that produced the vectors: after a
@@ -394,11 +405,18 @@ def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.Asy
 
     # -------------------------------------------------------------- models
     @app.get("/v1/models")
-    async def list_models():
-        data = [{"id": m, "object": "model", "created": 0, "owned_by": "gateway"} for m in registry.list_models()]
-        data.append({"id": "auto", "object": "model", "created": 0, "owned_by": "gateway"})
-        for alias in routing.aliases:
-            data.append({"id": alias, "object": "model", "created": 0, "owned_by": "gateway"})
+    async def list_models(request: Request):
+        """Models this key may call: concrete ids, ``auto`` and aliases."""
+        try:
+            key = authenticate(request)
+        except GatewayError as err:
+            return openai_error(err.status_code, err.message, err.err_type, err.headers)
+        ids = [m for m in registry.list_models() if key.allows_model(m)]
+        auto = routing.auto
+        if key.allows_model(auto.cheap_model) and key.allows_model(auto.strong_model):
+            ids.append("auto")
+        ids += [alias for alias, target in routing.aliases.items() if key.allows_model(target)]
+        data = [{"id": m, "object": "model", "created": 0, "owned_by": "gateway"} for m in ids]
         return {"object": "list", "data": data}
 
     # --------------------------------------------------------------- admin
@@ -595,7 +613,7 @@ async def relay_stream(
         ))
         completion_tokens = int(usage.get("completion_tokens") or approx_tokens(content))
         accounting.record(
-            virtual_key=key.name, model=gateway_model, provider=target.provider.name,
+            virtual_key=key.name, model=target.gateway_model, provider=target.provider.name,
             endpoint="chat", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached=False,
         )
         await resp.aclose()
