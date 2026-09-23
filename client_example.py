@@ -6,8 +6,11 @@ The only change versus talking to OpenAI directly is ``base_url`` and the
     pip install openai
     python client_example.py
 
-Assumes the gateway is running on http://localhost:8000 and that keys.yaml still
-contains the shipped demo key.
+Assumes the gateway is running on http://localhost:8000 (override with
+GATEWAY_URL) and that keys.yaml still contains the shipped demo key. No NVIDIA
+key handy? Serve the offline mock config instead - nothing else changes:
+
+    llm-gateway serve --config-dir examples/demo
 """
 
 from __future__ import annotations
@@ -17,7 +20,7 @@ import os
 from openai import OpenAI
 
 # The demo virtual key from the shipped keys.yaml. Replace with your own
-# (mint one with: python -m app.keys generate).
+# (mint one with: llm-gateway keys generate).
 GATEWAY_KEY = os.getenv("GATEWAY_KEY", "sk-gw-demo-000-not-a-real-secret")
 BASE_URL = os.getenv("GATEWAY_URL", "http://localhost:8000/v1")
 
