@@ -73,8 +73,13 @@ def new_completion_id(prefix: str = "chatcmpl") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:24]}"
 
 
-def build_chat_response(model: str, content: str, usage: dict[str, int]) -> dict[str, Any]:
-    """Assemble an OpenAI-shaped chat completion (used for cached stream replay)."""
+def build_chat_response(
+    model: str,
+    content: str,
+    usage: dict[str, int],
+    finish_reason: str = "stop",
+) -> dict[str, Any]:
+    """Assemble an OpenAI-shaped chat completion (used to cache streamed answers)."""
     return {
         "id": new_completion_id(),
         "object": "chat.completion",
@@ -84,7 +89,7 @@ def build_chat_response(model: str, content: str, usage: dict[str, int]) -> dict
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }
         ],
         "usage": usage,

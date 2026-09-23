@@ -13,9 +13,11 @@ Point any OpenAI SDK at this server by setting ``base_url`` to
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -23,8 +25,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from .accounting import Accounting, Pricing, approx_tokens
-from .cache import SemanticCache
+from .accounting import Accounting, Pricing, approx_tokens, next_month_start_epoch
+from .cache import CacheProbe, SemanticCache
 from .config import Settings
 from .fallback import UpstreamError, execute_with_fallback
 from .keys import KeyStore, VirtualKey
@@ -36,7 +38,7 @@ from .schemas import (
     EmbeddingRequest,
     build_chat_response,
 )
-from .upstream import parse_sse_content, post_chat, post_embeddings, stream_chat
+from .upstream import parse_sse_event, post_chat, post_embeddings, stream_chat
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -44,15 +46,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger("gateway")
 
+# Request fields that configure the gateway itself. They are consumed here and
+# never forwarded: OpenAI and most compatible servers reject unknown arguments.
+GATEWAY_ONLY_FIELDS = frozenset({"cache"})
+
 
 class GatewayError(Exception):
     """A request-scoped error that maps to an OpenAI-style error response."""
 
-    def __init__(self, status_code: int, message: str, err_type: str = "invalid_request_error") -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        err_type: str = "invalid_request_error",
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.err_type = err_type
+        self.headers = headers or {}
 
 
 def openai_error(status_code: int, message: str, err_type: str, headers: Optional[dict] = None) -> JSONResponse:
@@ -63,17 +76,39 @@ def openai_error(status_code: int, message: str, err_type: str, headers: Optiona
     )
 
 
+def upstream_body(body: dict[str, Any]) -> dict[str, Any]:
+    """The caller's body minus gateway-only fields."""
+    return {k: v for k, v in body.items() if k not in GATEWAY_ONLY_FIELDS}
+
+
+def client_status(err: UpstreamError) -> int:
+    """HTTP status the caller sees for an upstream failure.
+
+    Upstream auth failures (a revoked or missing *provider* key) are the
+    gateway's problem, not the caller's: surfacing them as 401/403 would make
+    the OpenAI SDK report the caller's own gateway key as invalid.
+    """
+    if err.status_code >= 500 or err.status_code in (401, 403):
+        return 502
+    return err.status_code
+
+
 def make_embedder(client: httpx.AsyncClient, registry: ProviderRegistry, embed_model: str):
     async def embed(text: str) -> list[float]:
         target = registry.resolve(embed_model)
-        payload = {"model": target.upstream_model, "input": text}
-        data = await post_embeddings(client, target.provider, payload)
+        data = await post_embeddings(client, target.provider, target.payload({"input": text}))
         return data["data"][0]["embedding"]
 
     return embed
 
 
-def build_app(settings: Optional[Settings] = None) -> FastAPI:
+def build_app(settings: Optional[Settings] = None, transport: Optional[httpx.AsyncBaseTransport] = None) -> FastAPI:
+    """Build the gateway app.
+
+    ``transport`` replaces the network layer of the shared upstream client (and
+    of the cache embedder, which uses the same client). Tests pass an
+    ``httpx.MockTransport`` here; production leaves it ``None``.
+    """
     settings = settings or Settings.from_env()
 
     from .db import Database
@@ -89,7 +124,7 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        client = httpx.AsyncClient(timeout=settings.request_timeout_seconds)
+        client = httpx.AsyncClient(timeout=settings.request_timeout_seconds, transport=transport)
         embedder = make_embedder(client, registry, settings.embed_model)
         cache = SemanticCache(
             db,
@@ -97,7 +132,10 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
             ttl_seconds=settings.cache_ttl_seconds,
             similarity_threshold=settings.cache_similarity_threshold,
             semantic_enabled=settings.semantic_cache_enabled,
+            max_entries=settings.cache_max_entries,
+            maintenance_interval_seconds=settings.cache_purge_interval_seconds,
         )
+        cache.maintain()
         app.state.client = client
         app.state.cache = cache
         logger.info(
@@ -110,7 +148,7 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
             await client.aclose()
             db.close()
 
-    app = FastAPI(title="llm-gateway", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="llm-gateway", version="0.2.0", lifespan=lifespan)
     app.state.settings = settings
     app.state.registry = registry
     app.state.router = router
@@ -133,17 +171,27 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
         rate = limiter.check(key.name, key.rpm)
         headers = rate.headers()
         if not rate.allowed:
-            raise GatewayError(429, f"rate limit exceeded for key '{key.name}'", "rate_limit_error")
+            raise GatewayError(
+                429, f"rate limit exceeded for key '{key.name}'", "rate_limit_error", headers,
+            )
         spent = accounting.month_cost(key.name)
-        budget = check_budget(spent, key.monthly_budget_usd)
+        budget = check_budget(spent, key.monthly_budget_usd, resets_at=next_month_start_epoch())
         headers.update(budget.headers())
         if not budget.allowed:
             raise GatewayError(
                 402,
                 f"monthly budget of ${key.monthly_budget_usd:.2f} exhausted for key '{key.name}'",
                 "budget_exceeded",
+                headers,
             )
         return headers
+
+    def require_admin(request: Request) -> None:
+        token = settings.admin_token
+        if token and not hmac.compare_digest(
+            request.headers.get("x-admin-token", "").encode("utf-8"), token.encode("utf-8")
+        ):
+            raise GatewayError(401, "invalid admin token", "authentication_error")
 
     def caching_allowed(route, body: dict[str, Any]) -> tuple[bool, bool]:
         exact = settings.cache_enabled and route.cache and body.get("cache") is not False
@@ -152,6 +200,7 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
             and settings.semantic_cache_enabled
             and route.semantic_cache
             and not body.get("tools")
+            and not body.get("functions")
             and (body.get("n") in (None, 1))
         )
         return exact, semantic
@@ -163,10 +212,11 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
             key = authenticate(request)
             limit_headers = enforce_limits(key)
             body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("the request body must be a JSON object")
             req = ChatCompletionRequest(**body)
         except GatewayError as err:
-            headers = err_headers(err)
-            return openai_error(err.status_code, err.message, err.err_type, headers)
+            return openai_error(err.status_code, err.message, err.err_type, err.headers)
         except (json.JSONDecodeError, ValueError, TypeError) as err:
             return openai_error(400, f"invalid request body: {err}", "invalid_request_error")
 
@@ -182,14 +232,16 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
         cache: SemanticCache = app.state.cache
         client: httpx.AsyncClient = app.state.client
         exact_ok, semantic_ok = caching_allowed(route, body)
+        wants_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
         # Cache lookup.
+        probe = CacheProbe(None)
         if exact_ok:
             try:
-                hit = await cache.lookup(gateway_model, body, allow_semantic=semantic_ok)
-            except Exception as exc:  # a failing embedder must not break the request
+                probe = await cache.probe(gateway_model, body, allow_semantic=semantic_ok)
+            except Exception as exc:  # noqa: BLE001 - the cache must never break a request
                 logger.warning("cache lookup failed: %s", exc)
-                hit = None
+            hit = probe.hit
             if hit is not None:
                 usage = hit.response.get("usage", {}) or {}
                 accounting.record(
@@ -205,7 +257,7 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
                 }
                 if req.stream:
                     return StreamingResponse(
-                        replay_stream(hit.response, gateway_model),
+                        replay_stream(hit.response, gateway_model, include_usage=wants_usage),
                         media_type="text/event-stream", headers=headers,
                     )
                 return JSONResponse(content=hit.response, headers=headers)
@@ -214,17 +266,19 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
         base_headers = {**limit_headers, "X-Cache": "MISS", "X-Gateway-Model": gateway_model}
         if decision.get("reason") not in (None, "exact"):
             base_headers["X-Gateway-Route"] = decision.get("reason", "")
+        forward = upstream_body(body)
 
         if req.stream:
             return StreamingResponse(
                 stream_and_account(
-                    app, client, chain, body, gateway_model, key, exact_ok, semantic_ok,
+                    app, client, chain, forward, body, gateway_model, key, exact_ok, semantic_ok,
+                    probe, wants_usage,
                 ),
                 media_type="text/event-stream", headers=base_headers,
             )
 
         async def attempt(target: Target) -> dict[str, Any]:
-            return await post_chat(client, target.provider, {**body, "model": target.upstream_model})
+            return await post_chat(client, target.provider, target.payload(forward))
 
         try:
             result = await execute_with_fallback(
@@ -232,11 +286,10 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
                 max_retries_per_target=settings.max_retries_per_target,
                 backoff_base=settings.backoff_base_seconds,
                 backoff_cap=settings.backoff_cap_seconds,
-                target_name=lambda t: f"{t.provider.name}:{t.upstream_model}",
+                target_name=lambda t: t.name,
             )
         except UpstreamError as err:
-            status = 502 if err.status_code >= 500 else err.status_code
-            return openai_error(status, err.message, "upstream_error", base_headers)
+            return openai_error(client_status(err), err.message, "upstream_error", base_headers)
 
         data = result.value
         used: Target = result.target
@@ -248,10 +301,7 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
             endpoint="chat", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached=False,
         )
         if exact_ok:
-            try:
-                await cache.store(gateway_model, body, data, allow_semantic=semantic_ok)
-            except Exception as exc:
-                logger.warning("cache store failed: %s", exc)
+            await _store_in_cache(cache, gateway_model, body, data, semantic_ok, probe)
 
         headers = {**base_headers, "X-Gateway-Provider": used.provider.name, "X-Upstream-Model": used.upstream_model}
         return JSONResponse(content=data, headers=headers)
@@ -263,9 +313,11 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
             key = authenticate(request)
             limit_headers = enforce_limits(key)
             body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("the request body must be a JSON object")
             req = EmbeddingRequest(**body)
         except GatewayError as err:
-            return openai_error(err.status_code, err.message, err.err_type, err_headers(err))
+            return openai_error(err.status_code, err.message, err.err_type, err.headers)
         except (json.JSONDecodeError, ValueError, TypeError) as err:
             return openai_error(400, f"invalid request body: {err}", "invalid_request_error")
 
@@ -279,9 +331,10 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
 
         client: httpx.AsyncClient = app.state.client
         chain = router.resolve_chain(model)
+        forward = upstream_body(body)
 
         async def attempt(target: Target) -> dict[str, Any]:
-            return await post_embeddings(client, target.provider, {**body, "model": target.upstream_model})
+            return await post_embeddings(client, target.provider, target.payload(forward))
 
         try:
             result = await execute_with_fallback(
@@ -289,11 +342,10 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
                 max_retries_per_target=settings.max_retries_per_target,
                 backoff_base=settings.backoff_base_seconds,
                 backoff_cap=settings.backoff_cap_seconds,
-                target_name=lambda t: f"{t.provider.name}:{t.upstream_model}",
+                target_name=lambda t: t.name,
             )
         except UpstreamError as err:
-            status = 502 if err.status_code >= 500 else err.status_code
-            return openai_error(status, err.message, "upstream_error", limit_headers)
+            return openai_error(client_status(err), err.message, "upstream_error", limit_headers)
 
         data = result.value
         used: Target = result.target
@@ -303,23 +355,28 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
             virtual_key=key.name, model=model, provider=used.provider.name,
             endpoint="embeddings", prompt_tokens=prompt_tokens, completion_tokens=0, cached=False,
         )
-        return JSONResponse(content=data, headers={**limit_headers, "X-Gateway-Provider": used.provider.name})
+        return JSONResponse(content=data, headers={
+            **limit_headers,
+            "X-Gateway-Model": used.gateway_model,
+            "X-Gateway-Provider": used.provider.name,
+        })
 
     # -------------------------------------------------------------- models
     @app.get("/v1/models")
     async def list_models():
-        data = [{"id": m, "object": "model", "owned_by": "gateway"} for m in registry.list_models()]
-        data.append({"id": "auto", "object": "model", "owned_by": "gateway"})
+        data = [{"id": m, "object": "model", "created": 0, "owned_by": "gateway"} for m in registry.list_models()]
+        data.append({"id": "auto", "object": "model", "created": 0, "owned_by": "gateway"})
         for alias in routing.aliases:
-            data.append({"id": alias, "object": "model", "owned_by": "gateway"})
+            data.append({"id": alias, "object": "model", "created": 0, "owned_by": "gateway"})
         return {"object": "list", "data": data}
 
     # --------------------------------------------------------------- admin
     @app.get("/admin/usage")
     async def admin_usage(request: Request):
-        admin_token = os.getenv("ADMIN_TOKEN")
-        if admin_token and request.headers.get("x-admin-token") != admin_token:
-            return openai_error(401, "invalid admin token", "authentication_error")
+        try:
+            require_admin(request)
+        except GatewayError as err:
+            return openai_error(err.status_code, err.message, err.err_type)
         summary = accounting.summary()
         want_json = request.query_params.get("format") == "json" or "application/json" in request.headers.get("accept", "")
         if want_json:
@@ -341,13 +398,24 @@ def build_app(settings: Optional[Settings] = None) -> FastAPI:
     return app
 
 
-def err_headers(err: GatewayError) -> dict[str, str]:
-    if err.status_code == 429:
-        return {"Retry-After": "1"}
-    return {}
-
-
 # ------------------------------------------------------------- helpers
+
+
+async def _store_in_cache(
+    cache: SemanticCache,
+    model: str,
+    body: dict[str, Any],
+    response: dict[str, Any],
+    semantic_ok: bool,
+    probe: CacheProbe,
+) -> None:
+    try:
+        await cache.store(
+            model, body, response, allow_semantic=semantic_ok,
+            vector=probe.vector, embed=not probe.embed_failed,
+        )
+    except Exception as exc:  # noqa: BLE001 - caching is best effort
+        logger.warning("cache store failed: %s", exc)
 
 
 def _prompt_text(req: ChatCompletionRequest) -> str:
@@ -371,25 +439,34 @@ def _embed_input_text(req: EmbeddingRequest) -> str:
     return str(req.input)
 
 
-async def replay_stream(response: dict[str, Any], model: str):
-    """Turn a cached full completion back into a minimal SSE stream."""
-    content = _completion_text(response)
+def _sse(obj: Any) -> bytes:
+    return f"data: {json.dumps(obj)}\n\n".encode("utf-8")
+
+
+async def replay_stream(response: dict[str, Any], model: str, include_usage: bool = False):
+    """Turn a cached full completion back into an OpenAI-shaped SSE stream."""
     completion_id = response.get("id", "chatcmpl-cache")
-    first = {
-        "id": completion_id, "object": "chat.completion.chunk", "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-    }
-    yield f"data: {json.dumps(first)}\n\n".encode("utf-8")
-    body = {
-        "id": completion_id, "object": "chat.completion.chunk", "model": model,
-        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-    }
-    yield f"data: {json.dumps(body)}\n\n".encode("utf-8")
-    last = {
-        "id": completion_id, "object": "chat.completion.chunk", "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-    }
-    yield f"data: {json.dumps(last)}\n\n".encode("utf-8")
+    created = int(response.get("created") or time.time())
+
+    def chunk(choices: list[dict[str, Any]], **extra: Any) -> dict[str, Any]:
+        return {
+            "id": completion_id, "object": "chat.completion.chunk", "created": created,
+            "model": model, "choices": choices, **extra,
+        }
+
+    for choice in response.get("choices") or [{"index": 0, "message": {}}]:
+        index = choice.get("index", 0)
+        message = choice.get("message") or {}
+        yield _sse(chunk([{"index": index, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]))
+        if isinstance(message.get("content"), str) and message["content"]:
+            yield _sse(chunk([{"index": index, "delta": {"content": message["content"]}, "finish_reason": None}]))
+        if message.get("tool_calls"):
+            calls = [{**call, "index": i} for i, call in enumerate(message["tool_calls"])]
+            yield _sse(chunk([{"index": index, "delta": {"tool_calls": calls}, "finish_reason": None}]))
+        finish = choice.get("finish_reason") or "stop"
+        yield _sse(chunk([{"index": index, "delta": {}, "finish_reason": finish}]))
+    if include_usage:
+        yield _sse(chunk([], usage=response.get("usage") or {}))
     yield b"data: [DONE]\n\n"
 
 
@@ -397,32 +474,53 @@ async def stream_and_account(
     app: FastAPI,
     client: httpx.AsyncClient,
     chain: list[Target],
+    forward: dict[str, Any],
     body: dict[str, Any],
     gateway_model: str,
     key: VirtualKey,
     exact_ok: bool,
     semantic_ok: bool,
+    probe: CacheProbe,
+    wants_usage: bool,
 ):
-    """Stream from the first working target, then record usage and cache."""
+    """Stream from the first working target, then record usage and cache.
+
+    The gateway always asks the upstream for a usage chunk (for accounting),
+    but only forwards it when the caller asked for one: the chunk has an empty
+    ``choices`` list, which clients that did not opt in do not expect.
+    """
     accounting: Accounting = app.state.accounting
     cache: SemanticCache = app.state.cache
     accumulated: list[str] = []
     usage: dict[str, Any] = {}
     used: Optional[Target] = None
     started = False
+    saw_tool_calls = False
+    finish_reason: Optional[str] = None
     last_error: Optional[UpstreamError] = None
 
     for target in chain:
-        payload = {**body, "model": target.upstream_model}
         try:
-            async for chunk in stream_chat(client, target.provider, payload):
+            async for chunk in stream_chat(client, target.provider, target.payload(forward)):
                 started = True
                 used = target
-                text, u = parse_sse_content(chunk.decode("utf-8", "replace").strip())
-                if text:
-                    accumulated.append(text)
-                if u:
-                    usage = u
+                event = parse_sse_event(chunk.decode("utf-8", "replace").strip())
+                if event is not None:
+                    if event.get("usage"):
+                        usage = event["usage"]
+                    choices = event.get("choices")
+                    for choice in choices or []:
+                        if choice.get("index", 0) != 0:
+                            continue
+                        delta = choice.get("delta") or {}
+                        if isinstance(delta.get("content"), str):
+                            accumulated.append(delta["content"])
+                        if delta.get("tool_calls"):
+                            saw_tool_calls = True
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                    if choices == [] and "usage" in event and not wants_usage:
+                        continue
                 yield chunk
             used = used or target
             break
@@ -447,16 +545,14 @@ async def stream_and_account(
         virtual_key=key.name, model=gateway_model, provider=provider_name,
         endpoint="chat", prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cached=False,
     )
-    if exact_ok and content:
+    if exact_ok and content and not saw_tool_calls and body.get("n") in (None, 1):
         response = build_chat_response(
             gateway_model, content,
             {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
              "total_tokens": prompt_tokens + completion_tokens},
+            finish_reason=finish_reason or "stop",
         )
-        try:
-            await cache.store(gateway_model, body, response, allow_semantic=semantic_ok)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("cache store failed: %s", exc)
+        await _store_in_cache(cache, gateway_model, body, response, semantic_ok, probe)
 
 
 def _sse_error(err: UpstreamError) -> bytes:

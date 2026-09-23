@@ -79,6 +79,13 @@ def _month_start_epoch(now: Optional[float] = None) -> float:
     return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc).timestamp()
 
 
+def next_month_start_epoch(now: Optional[float] = None) -> float:
+    """When the current monthly budget window ends (first instant of next UTC month)."""
+    dt = datetime.fromtimestamp(now or time.time(), tz=timezone.utc)
+    year, month = (dt.year + 1, 1) if dt.month == 12 else (dt.year, dt.month + 1)
+    return datetime(year, month, 1, tzinfo=timezone.utc).timestamp()
+
+
 class Accounting:
     def __init__(self, db: Database, pricing: Pricing) -> None:
         self.db = db

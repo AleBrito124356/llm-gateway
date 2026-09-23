@@ -136,16 +136,24 @@ async def stream_chat(
         raise UpstreamError(504, f"{provider.name} transport error: {exc}", retryable=True) from exc
 
 
-def parse_sse_content(line: str) -> tuple[str, dict[str, Any] | None]:
-    """Extract the incremental content and any usage block from one SSE line."""
+def parse_sse_event(line: str) -> dict[str, Any] | None:
+    """Parse one ``data:`` SSE line into its JSON object (None for anything else)."""
     if not line.startswith("data:"):
-        return "", None
+        return None
     data = line[len("data:"):].strip()
     if data == "[DONE]" or not data:
-        return "", None
+        return None
     try:
         obj = json.loads(data)
     except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def parse_sse_content(line: str) -> tuple[str, dict[str, Any] | None]:
+    """Extract the incremental content and any usage block from one SSE line."""
+    obj = parse_sse_event(line)
+    if obj is None:
         return "", None
     delta_text = ""
     for choice in obj.get("choices", []) or []:
