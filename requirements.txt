@@ -12,3 +12,6 @@ openai>=1.30
 # Tests
 pytest>=8.0
 pytest-asyncio>=0.23
+coverage>=7.4
+
+# Or, equivalently: pip install -e ".[dev]"  (also installs the llm-gateway command)

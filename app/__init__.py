@@ -4,4 +4,4 @@ Semantic caching, model routing, cross-provider fallback, per-key rate limits
 and cost accounting in front of NVIDIA NIM, Ollama or any OpenAI-style upstream.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -54,8 +54,9 @@ class Settings:
     # How often expired rows are purged and the cap is enforced.
     cache_purge_interval_seconds: float = 300.0
 
+    # Embedding model used by the semantic cache. ``local/hash`` is a built-in,
+    # offline feature-hashing embedder that needs no provider at all.
     embed_model: str = "nvidia/nv-embedqa-e5-v5"
-    default_chat_model: str = "meta/llama-3.3-70b-instruct"
 
     max_retries_per_target: int = 2
     backoff_base_seconds: float = 0.5
@@ -105,7 +106,6 @@ class Settings:
             cache_max_entries=_env_int(env, "CACHE_MAX_ENTRIES", 10_000),
             cache_purge_interval_seconds=_env_float(env, "CACHE_PURGE_INTERVAL_SECONDS", 300.0),
             embed_model=env.get("EMBED_MODEL") or "nvidia/nv-embedqa-e5-v5",
-            default_chat_model=env.get("NIM_MODEL") or "meta/llama-3.3-70b-instruct",
             max_retries_per_target=_env_int(env, "MAX_RETRIES_PER_TARGET", 2),
             backoff_base_seconds=_env_float(env, "BACKOFF_BASE_SECONDS", 0.5),
             backoff_cap_seconds=_env_float(env, "BACKOFF_CAP_SECONDS", 8.0),

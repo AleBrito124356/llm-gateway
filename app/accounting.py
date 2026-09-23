@@ -6,6 +6,11 @@ costs nothing; the reference prices ship so the ledger is still meaningful (they
 approximate what the same tokens would cost on a paid Llama host) and so you can
 price your own hosted upstreams accurately. Set any model to 0 to track tokens
 only.
+
+A cache hit is recorded with its tokens but ``cost_usd = 0``. ``summary`` turns
+those cached rows back into dollars (``saved_usd``) with
+``cache.estimated_savings`` at the current prices: what the hits would have
+cost had they gone upstream.
 """
 
 from __future__ import annotations
@@ -13,10 +18,12 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from .cache import estimated_savings
 from .db import Database
 
 
@@ -132,6 +139,27 @@ class Accounting:
         )
         return float(row["c"]) if row else 0.0
 
+    def savings(self) -> dict[str, Any]:
+        """USD not spent thanks to cache hits, per key, per (model, provider) and in total."""
+        rows = self.db.query(
+            "SELECT virtual_key, model, provider, COUNT(*) AS hits, "
+            "SUM(prompt_tokens) AS p, SUM(completion_tokens) AS c "
+            "FROM usage WHERE cached = 1 GROUP BY virtual_key, model, provider"
+        )
+        by_key: dict[str, float] = defaultdict(float)
+        by_model: dict[tuple[str, str], float] = defaultdict(float)
+        total = 0.0
+        for row in rows:
+            hits = int(row["hits"])
+            price = self.pricing.for_model(row["model"])
+            saved = estimated_savings(
+                hits, (row["p"] or 0) / hits, (row["c"] or 0) / hits, price.input_per_1m, price.output_per_1m,
+            )
+            by_key[row["virtual_key"]] += saved
+            by_model[(row["model"], row["provider"])] += saved
+            total += saved
+        return {"by_key": dict(by_key), "by_model": dict(by_model), "total": total}
+
     def summary(self) -> dict[str, Any]:
         by_key = self.db.query(
             "SELECT virtual_key, COUNT(*) AS requests, "
@@ -148,11 +176,16 @@ class Accounting:
             "SELECT COUNT(*) AS requests, SUM(total_tokens) AS total_tokens, "
             "SUM(cost_usd) AS cost_usd, SUM(cached) AS cache_hits FROM usage"
         )
-        return {
-            "totals": _row(totals),
-            "by_key": [_row(r) for r in by_key],
-            "by_model": [_row(r) for r in by_model],
-        }
+        saved = self.savings()
+        keys = [_row(r) for r in by_key]
+        for row in keys:
+            row["saved_usd"] = round(saved["by_key"].get(row["virtual_key"], 0.0), 8)
+        models = [_row(r) for r in by_model]
+        for row in models:
+            row["saved_usd"] = round(saved["by_model"].get((row["model"], row["provider"]), 0.0), 8)
+        total_row = _row(totals)
+        total_row["saved_usd"] = round(saved["total"], 8)
+        return {"totals": total_row, "by_key": keys, "by_model": models}
 
 
 def _row(row: Any) -> dict[str, Any]:
@@ -161,5 +194,9 @@ def _row(row: Any) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key in row.keys():
         value = row[key]
-        result[key] = value if value is not None else 0
+        if value is None:
+            value = 0
+        elif isinstance(value, float):
+            value = round(value, 8)  # 6.2399999999999995e-06 -> 6.24e-06
+        result[key] = value
     return result

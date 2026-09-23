@@ -9,6 +9,8 @@ Run this module directly to mint a key:
 
     python -m app.keys generate --name mobile-app --rpm 120 --budget 25
     python -m app.keys hash sk-gw-existing-key
+
+(``llm-gateway keys ...`` is the same command once the package is installed.)
 """
 
 from __future__ import annotations
@@ -64,7 +66,8 @@ class KeyStore:
             keys.append(
                 VirtualKey(
                     name=spec["name"],
-                    key_hash=spec["key_hash"],
+                    # str(): an unquoted all-digit hash is parsed by YAML as an int.
+                    key_hash=str(spec["key_hash"]).strip().lower(),
                     rpm=int(spec.get("rpm", 60)),
                     monthly_budget_usd=None if budget is None else float(budget),
                     allowed_models=list(spec.get("allowed_models", ["*"])),
@@ -81,33 +84,49 @@ class KeyStore:
         return len(self._by_hash)
 
 
-def _cli() -> None:
-    parser = argparse.ArgumentParser(description="Manage gateway virtual keys.")
-    sub = parser.add_subparsers(dest="command", required=True)
-
+def add_key_commands(sub: "argparse._SubParsersAction") -> None:
+    """Register ``generate`` and ``hash`` on an argparse sub-command group."""
     gen = sub.add_parser("generate", help="mint a new key and print its keys.yaml entry")
     gen.add_argument("--name", default="new-key")
     gen.add_argument("--rpm", type=int, default=60)
-    gen.add_argument("--budget", type=float, default=None)
+    gen.add_argument("--budget", type=float, default=None, help="monthly budget in USD (omit for unlimited)")
+    gen.add_argument("--models", nargs="+", default=["*"], metavar="GLOB",
+                     help="allowed model globs (default: all models)")
 
     h = sub.add_parser("hash", help="print the SHA-256 hash of an existing key")
     h.add_argument("key")
 
-    args = parser.parse_args()
 
+def keys_yaml_entry(name: str, key_hash: str, rpm: int, budget: Optional[float],
+                    models: list[str]) -> str:
+    # Quoted: YAML would read an (astronomically unlikely) all-digit hash as a number.
+    lines = [f"  - name: {name}", f'    key_hash: "{key_hash}"', f"    rpm: {rpm}"]
+    if budget is not None:
+        lines.append(f"    monthly_budget_usd: {budget}")
+    lines.append("    allowed_models: [" + ", ".join(f'"{m}"' for m in models) + "]")
+    return "\n".join(lines)
+
+
+def run_key_command(args: argparse.Namespace) -> int:
     if args.command == "generate":
+        if args.rpm <= 0:
+            print("error: --rpm must be positive")
+            return 2
         key = generate_key()
         print(f"# Give this key to the caller (it is shown only once):\n{key}\n")
         print("# Add this entry under 'keys:' in keys.yaml:")
-        print(f"  - name: {args.name}")
-        print(f"    key_hash: {hash_key(key)}")
-        print(f"    rpm: {args.rpm}")
-        if args.budget is not None:
-            print(f"    monthly_budget_usd: {args.budget}")
-        print('    allowed_models: ["*"]')
+        print(keys_yaml_entry(args.name, hash_key(key), args.rpm, args.budget, args.models))
     elif args.command == "hash":
         print(hash_key(args.key))
+    return 0
+
+
+def _cli(argv: Optional[list[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m app.keys", description="Manage gateway virtual keys.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    add_key_commands(sub)
+    return run_key_command(parser.parse_args(argv))
 
 
 if __name__ == "__main__":
-    _cli()
+    raise SystemExit(_cli())

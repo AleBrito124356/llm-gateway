@@ -10,9 +10,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Application code and default config.
+# Application code, default config, and the offline demo config
+# (docker compose run --rm gateway python -m app demo).
 COPY app ./app
 COPY providers.yaml routing.yaml keys.yaml pricing.json ./
+COPY examples ./examples
 
 # SQLite state lives here; mount a volume to persist the ledger + cache.
 ENV GATEWAY_DB=/data/gateway.db

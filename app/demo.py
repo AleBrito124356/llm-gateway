@@ -247,11 +247,19 @@ async def _stages(r: _Runner) -> None:
     summary = (await r.client.get("/admin/usage", params={"format": "json"})).json()
     totals = summary["totals"]
     r.note(f"totals: {totals['requests']} requests, {totals['total_tokens']} tokens, "
-           f"{totals['cache_hits']} cache hits, cost ${totals['cost_usd']:.6f}")
+           f"{totals['cache_hits']} cache hits, cost ${totals['cost_usd']:.6f}, saved ${totals['saved_usd']:.6f}")
     for row in summary["by_key"]:
         r.note(f"  key {row['virtual_key']:<12} requests {row['requests']:>3}  cache hits {row['cache_hits']:>2}  "
-               f"cost ${row['cost_usd']:.6f}")
-    r.check(totals["cache_hits"] >= 3, "cache hits were recorded at $0")
+               f"cost ${row['cost_usd']:.6f}  saved ${row['saved_usd']:.6f}")
+    r.check(totals["cache_hits"] >= 3 and totals["saved_usd"] > 0,
+            "cache hits cost $0 and their would-be cost shows up as saved_usd")
+
+    # 9 --------------------------------------------------------------- reload
+    r.stage(9, "Hot reload: POST /admin/reload re-reads the config files without a restart")
+    reloaded = (await r.client.post("/admin/reload")).json()
+    r.note(f"> POST /admin/reload -> {reloaded.get('status')}: {reloaded.get('models')} models, "
+           f"{reloaded.get('keys')} keys")
+    r.check(reloaded.get("status") == "reloaded", "config re-validated and swapped in atomically")
 
 
 async def run_demo(

@@ -1,8 +1,10 @@
 # Virtual gateway keys. Only SHA-256 hashes are stored, so this file is safe to
 # commit and clients never see your upstream provider keys.
 #
-# Mint a new key:  python -m app.keys generate --name my-app --rpm 120 --budget 25
-# Hash an existing one: python -m app.keys hash sk-gw-...
+# Mint a new key:  llm-gateway keys generate --name my-app --rpm 120 --budget 25
+# Hash an existing one: llm-gateway keys hash sk-gw-...
+# (python -m app.keys ... works too, without installing the package.)
+# Check the file: llm-gateway check-config
 #
 # allowed_models supports globs ("*", "meta/*"). monthly_budget_usd is optional
 # (omit for unlimited). rpm is the token-bucket request-per-minute limit.
@@ -17,8 +19,11 @@ keys:
     allowed_models: ["*"]
 
   # Example of a locked-down key: only the cheap model, tight budget.
+  # The hash is a placeholder no key hashes to; replace it with the output of
+  # `llm-gateway keys generate`. Quote hashes: an unquoted all-digit value
+  # would be read by YAML as a number.
   - name: cheap-only
-    key_hash: 0000000000000000000000000000000000000000000000000000000000000000
+    key_hash: "0000000000000000000000000000000000000000000000000000000000000000"
     rpm: 30
     monthly_budget_usd: 1.0
     allowed_models: ["meta/llama-3.1-8b-instruct", "nvidia/nv-embedqa-e5-v5"]
